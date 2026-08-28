@@ -93,10 +93,18 @@ served the request, the account email, and the raw usage response.
 
 | Action | Result |
 | --- | --- |
+| **X button** (top right) | Close the widget and quit |
+| **Esc** | Same |
+| Right-click the widget | Refresh, hide to tray, close |
 | Drag | Move the widget (position is remembered) |
 | Double-click | Refresh now |
 | Tray icon (right-click) | Show/hide, refresh, startup toggle, transparency, exit |
 | Tray icon (hover) | 5h and 7d percentages at a glance |
+
+The widget is a borderless window, so it has no title bar of its own — the X in its
+top-right corner is the close button. Windows 11 hides new tray icons in the "^"
+overflow by default, so don't rely on finding the tray icon to quit; the X and
+right-click menu are always there. Closing shuts the process down completely.
 
 ## Notes
 
