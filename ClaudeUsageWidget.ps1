@@ -519,10 +519,19 @@ if ($Diagnose) { Invoke-Diagnose; return }
   <Border CornerRadius="14" Background="#F21B1B1F" BorderBrush="#26FFFFFF" BorderThickness="1" Padding="14,12,14,13">
     <StackPanel>
       <Grid Margin="0,0,0,10">
-        <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+        <Grid.ColumnDefinitions>
+          <ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/><ColumnDefinition Width="Auto"/>
+        </Grid.ColumnDefinitions>
         <TextBlock Grid.Column="0" Text="CLAUDE USAGE" Foreground="#FFFFFF" FontFamily="Segoe UI"
-                   FontSize="11" FontWeight="SemiBold" Opacity="0.92"/>
-        <TextBlock Grid.Column="1" x:Name="StatusText" Text="" Foreground="#9A9AA5" FontFamily="Segoe UI" FontSize="10"/>
+                   FontSize="11" FontWeight="SemiBold" Opacity="0.92" VerticalAlignment="Center"/>
+        <TextBlock Grid.Column="1" x:Name="StatusText" Text="" Foreground="#9A9AA5" FontFamily="Segoe UI"
+                   FontSize="10" VerticalAlignment="Center"/>
+        <!-- Background must be a real brush, not null, or it will not be hit-testable -->
+        <Border Grid.Column="2" x:Name="CloseBtn" Background="#00FFFFFF" Cursor="Hand" CornerRadius="4"
+                Margin="9,-3,-4,-3" Padding="6,2,6,3" ToolTip="Close (Esc)" VerticalAlignment="Center">
+          <TextBlock x:Name="CloseGlyph" Text="&#x2715;" Foreground="#8A8A95" FontFamily="Segoe UI"
+                     FontSize="11" VerticalAlignment="Center"/>
+        </Border>
       </Grid>
       <TextBlock x:Name="AccountText" Text="" Foreground="#8A8A95" FontFamily="Segoe UI" FontSize="10"
                  Margin="0,-6,0,9" TextTrimming="CharacterEllipsis" Visibility="Collapsed"/>
@@ -541,6 +550,8 @@ $rows       = $win.FindName('Rows')
 $statusText = $win.FindName('StatusText')
 $hintText   = $win.FindName('HintText')
 $accountText = $win.FindName('AccountText')
+$closeBtn   = $win.FindName('CloseBtn')
+$closeGlyph = $win.FindName('CloseGlyph')
 $win.Opacity = [double]$Script:State.Opacity
 
 if ($null -ne $Script:State.Left -and $null -ne $Script:State.Top) {
@@ -710,6 +721,13 @@ function Update-Usage {
 
 # ---------------------------------------------------------------- interaction
 
+# Every quit route funnels through here so the tray icon can never be orphaned.
+function Close-Widget {
+    try { if ($timer) { $timer.Stop() } } catch { }
+    try { if ($tray)  { $tray.Visible = $false; $tray.Dispose() } } catch { }
+    try { $win.Close() } catch { }
+}
+
 # PowerShell event handlers get (sender, eventArgs) as $args - $_ is NOT populated here.
 $win.Add_MouseLeftButtonDown({
     param($sender, $e)
@@ -719,6 +737,41 @@ $win.Add_MouseLeftButtonDown({
 $win.Add_LocationChanged({
     $Script:State.Left = $win.Left; $Script:State.Top = $win.Top; Save-State
 })
+
+# Esc closes, like any ordinary window
+$win.Add_KeyDown({
+    param($sender, $e)
+    if ($e -and $e.Key -eq 'Escape') { Close-Widget }
+})
+
+# --- close button -------------------------------------------------
+# MouseLeftButtonDown bubbles to the window, whose handler calls DragMove() and
+# captures the mouse - so mark it handled here or the click never lands.
+$closeBtn.Add_MouseLeftButtonDown({
+    param($sender, $e)
+    if ($e) { $e.Handled = $true }
+    Close-Widget
+})
+$closeBtn.Add_MouseEnter({ $closeBtn.Background = (B '#E0F87171'); $closeGlyph.Foreground = (B '#FFFFFF') })
+$closeBtn.Add_MouseLeave({ $closeBtn.Background = (B '#00FFFFFF'); $closeGlyph.Foreground = (B '#8A8A95') })
+
+# --- right-click menu on the widget itself, so quitting is discoverable
+# without hunting for a tray icon Windows may have hidden in the overflow
+$ctx = New-Object System.Windows.Controls.ContextMenu
+$ctxRefresh = New-Object System.Windows.Controls.MenuItem
+$ctxRefresh.Header = 'Refresh now'
+$ctxRefresh.Add_Click({ $Script:NextFetchAt = [datetime]::MinValue; $Script:Backoff = 0 })
+$ctxHide = New-Object System.Windows.Controls.MenuItem
+$ctxHide.Header = 'Hide to tray'
+$ctxHide.Add_Click({ $win.Hide() })
+$ctxClose = New-Object System.Windows.Controls.MenuItem
+$ctxClose.Header = 'Close'
+$ctxClose.Add_Click({ Close-Widget })
+$ctx.Items.Add($ctxRefresh) | Out-Null
+$ctx.Items.Add($ctxHide)    | Out-Null
+$ctx.Items.Add((New-Object System.Windows.Controls.Separator)) | Out-Null
+$ctx.Items.Add($ctxClose)   | Out-Null
+$win.ContextMenu = $ctx
 
 # --- tray icon ---------------------------------------------------
 $bmp = New-Object System.Drawing.Bitmap 32, 32
@@ -769,7 +822,7 @@ $miStart.Add_Click({
         $lnk.Save(); $miStart.Checked = $true
     }
 })
-$miExit.Add_Click({ $tray.Visible = $false; $win.Close() })
+$miExit.Add_Click({ Close-Widget })
 $tray.Add_MouseDoubleClick({ $win.Show(); $win.Activate() })
 
 $win.Add_Closed({ $tray.Visible = $false; $tray.Dispose(); [System.Windows.Threading.Dispatcher]::CurrentDispatcher.InvokeShutdown() })
@@ -795,3 +848,11 @@ Show-Message 'Loading...'
 $win.Show()
 $timer.Start()
 [System.Windows.Threading.Dispatcher]::Run()
+
+# The message loop has ended. Release everything explicitly and exit, so a stray
+# handle can never leave powershell.exe running invisibly in the background.
+try { $timer.Stop() } catch { }
+try { if ($tray) { $tray.Visible = $false; $tray.Dispose() } } catch { }
+try { $icon.Dispose() } catch { }
+try { $bmp.Dispose() } catch { }
+[Environment]::Exit(0)
