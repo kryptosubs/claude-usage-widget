@@ -1,0 +1,6 @@
+# Runtime state — CONTAINS A CACHED OAUTH ACCESS TOKEN - never commit this.
+widget-state.json
+
+# Build artifact
+claude-usage-widget.zip
+*.zip
