@@ -44,6 +44,7 @@ $Script:State = [ordered]@{
     ScaleOverride  = 'auto'   # 'auto' | 'percent' | 'fraction'
     CachedToken    = $null
     CachedExpires  = 0
+    CachedRefresh  = $null    # our own rotated refresh token - see Get-AccessToken
 }
 
 function Load-State {
@@ -56,8 +57,29 @@ function Load-State {
         } catch { }
     }
 }
+$Script:StateProtected = $false
+# widget-state.json holds a refresh token, so it must not be world-readable.
+# The script can live anywhere (Downloads, a shared folder), so don't rely on
+# the parent directory's ACL - set an explicit owner-only rule once.
+function Protect-StateFile {
+    if ($Script:StateProtected) { return }
+    try {
+        $acl = Get-Acl -Path $Script:StatePath
+        $acl.SetAccessRuleProtection($true, $false)   # stop inheriting, drop inherited entries
+        foreach ($r in @($acl.Access)) { [void]$acl.RemoveAccessRule($r) }
+        $me   = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+        $rule = New-Object System.Security.AccessControl.FileSystemAccessRule($me, 'FullControl', 'Allow')
+        $acl.SetAccessRule($rule)
+        Set-Acl -Path $Script:StatePath -AclObject $acl
+        $Script:StateProtected = $true
+    } catch { }
+}
+
 function Save-State {
-    try { ($Script:State | ConvertTo-Json -Compress) | Set-Content -Path $Script:StatePath -Encoding UTF8 } catch { }
+    try {
+        ($Script:State | ConvertTo-Json -Compress) | Set-Content -Path $Script:StatePath -Encoding UTF8
+        Protect-StateFile
+    } catch { }
 }
 
 # ---------------------------------------------------------------- token discovery
@@ -205,23 +227,43 @@ function Get-AccessToken {
         }
     }
 
-    # pass 2: expired - try to refresh, freshest first
-    $errs = @()
+    # pass 2: expired - refresh.
+    #
+    # OAuth refresh tokens ROTATE: the server hands back a new refresh_token and the
+    # one we just spent is invalidated. Discarding it means the next refresh replays a
+    # dead token and fails forever, so we persist ours and prefer it over the copy in
+    # Claude Code's file, which goes stale the moment we refresh once. That is what
+    # lets the widget keep itself signed in indefinitely without touching that file.
+    $candidates = New-Object System.Collections.Generic.List[object]
+    if ($Script:State.CachedRefresh) {
+        $candidates.Add(@{ Label = 'widget-state.json'; Token = $Script:State.CachedRefresh; Own = $true })
+    }
     foreach ($c in $sources) {
-        if (-not $c.HasRefresh) { continue }
+        if ($c.HasRefresh) { $candidates.Add(@{ Label = $c.Label; Token = $c.Oauth.refreshToken; Own = $false }) }
+    }
+
+    $errs = @()
+    foreach ($cand in $candidates.ToArray()) {
         try {
-            $t = Invoke-TokenRefresh $c.Oauth.refreshToken
+            $t = Invoke-TokenRefresh $cand.Token
             if ($t -and $t.access_token) {
                 $Script:State.CachedToken = $t.access_token
                 $ttl = 3600
                 if ($t.PSObject.Properties.Name -contains 'expires_in' -and $t.expires_in) { $ttl = [int]$t.expires_in }
                 $Script:State.CachedExpires = $now + ($ttl * 1000)
+                if ($t.PSObject.Properties.Name -contains 'refresh_token' -and $t.refresh_token) {
+                    $Script:State.CachedRefresh = $t.refresh_token
+                }
                 Save-State
-                $Script:UsedSource = $c.Label + ' (refreshed)'
+                $Script:UsedSource = $cand.Label + ' (refreshed)'
                 return $t.access_token
             }
         }
-        catch { $errs += ('{0} -> {1}' -f $c.Label, $_.Exception.Message) }
+        catch {
+            $errs += ('{0} -> {1}' -f $cand.Label, $_.Exception.Message)
+            # our stored token is spent or revoked - drop it and fall back to the file
+            if ($cand.Own) { $Script:State.CachedRefresh = $null; Save-State }
+        }
     }
     if ($errs.Count) { $Script:LastRefreshError = ($errs -join ' | ') }
 
@@ -441,6 +483,10 @@ function Invoke-Diagnose {
             if ($c.HasRefresh) { $r = 'refresh token present' }
             Write-Host ("  {0}" -f $c.Label)
             Write-Host ("      {0}, {1}" -f $when, $r) -ForegroundColor $colour
+        }
+        if ($Script:State.CachedRefresh) {
+            Write-Host ''
+            Write-Host '  widget-state.json: holds its own rotated refresh token (self-renewing)' -ForegroundColor Green
         }
         Write-Host ''
         Write-Host '(the freshest login is used; expired ones are refreshed or skipped)' -ForegroundColor DarkGray
