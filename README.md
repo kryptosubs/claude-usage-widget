@@ -64,16 +64,37 @@ reading the account you care about rather than some other login left on the mach
 To point it at a specific account, sign in as that account in Claude Code
 (`/login`), then restart the widget. Its credentials file is what the widget reads.
 
-### About long-lived tokens
+### Keeping it signed in (long-lasting credential)
 
-`claude setup-token` produces a one-year token, but **it does not work for this
-widget**: the usage endpoint rejects `sk-ant-oat01-...` tokens with HTTP 403. Those
-tokens are scoped to model requests only. Verified against a real token, not assumed.
+There is no long-lived token you can paste in. `claude setup-token` produces a
+one-year token, but **the usage endpoint rejects `sk-ant-oat01-...` tokens with HTTP
+403** — they are scoped to model requests only. Verified against a real token, not
+assumed. A Console API key doesn't work either: it bills separately and wouldn't
+report your subscription's usage.
 
-Use the `/login` credentials instead — the widget reads and refreshes them
-automatically. That keeps working as long as you use Claude Code from time to time.
-If a login sits unused long enough to expire beyond refresh, the widget shows `auth`
-and you run `/login` once.
+What actually lasts is the `/login` credential, kept alive automatically:
+
+1. Sign in once: run `claude` (in WSL if that's where you use it) and `/login`.
+2. Start the widget and leave it running — add it to startup with
+   `Install-Startup.cmd` or the tray menu's **Run at Windows startup**.
+
+From then on the widget renews itself. When its access token expires it refreshes,
+stores the result in `widget-state.json`, and **keeps the rotated refresh token the
+server returns**. That last part matters: OAuth refresh tokens rotate — the one you
+just spent is invalidated — so a client that replays the original copy works exactly
+once and then fails forever. The widget advances the chain instead, which is what
+lets it stay signed in indefinitely without you touching it, and without ever writing
+to Claude Code's own credentials file.
+
+The chain only advances while the widget runs. If it's left off long enough for the
+stored refresh token to expire, it falls back to the credentials file; if that is
+stale too, it shows `auth` and you run `/login` once more. `Diagnose.cmd` prints
+`self-renewing` once the widget holds its own token.
+
+Because that file now holds a refresh token, the widget sets an owner-only ACL on
+`widget-state.json` — it does not rely on wherever you happened to unzip the folder.
+Treat it like a password: don't commit it or copy it to another machine. `.gitignore`
+already excludes it.
 
 ## When something goes wrong
 
@@ -124,7 +145,8 @@ right-click menu are always there. Closing shuts the process down completely.
 - Each row shows the countdown plus the wall-clock time it lands on, in your own
   time zone and locale: "resets in 4h 25m (4:20 PM)" today, "(Tue 3:00 PM)" within
   the week, "(Sep 9 11:55 AM)" beyond it.
-- Settings and window position live in `widget-state.json` beside the script.
+- Settings, window position and the renewed credential live in `widget-state.json`
+  beside the script (owner-only ACL; never commit it).
 - `/api/oauth/usage` is undocumented and used internally by Claude Code's own usage
   HUD. If Anthropic changes the `anthropic-beta: oauth-2025-04-20` header value, the
   widget will show `auth` and you'll need to bump that string in the script.
