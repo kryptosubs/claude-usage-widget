@@ -322,6 +322,86 @@ function Get-ProfileEmail($p) {
     return $null
 }
 
+# Money in this API arrives in MINOR units (cents for USD) with an explicit
+# exponent / decimal_places. Reading it as a major unit overstates every figure
+# by 100x, which is exactly what "$5000.00 of $5000.00" looked like.
+function ConvertFrom-MinorUnits($value, $exponent) {
+    if ($null -eq $value) { return $null }
+    $e = 2
+    if ($null -ne $exponent) { try { $e = [int]$exponent } catch { $e = 2 } }
+    if ($e -lt 0 -or $e -gt 6) { $e = 2 }
+    return [double]$value / [math]::Pow(10, $e)
+}
+
+function Format-Money($amount, $currency, $exponent) {
+    if ($null -eq $amount) { return '' }
+    $e = 2
+    if ($null -ne $exponent) { try { $e = [int]$exponent } catch { $e = 2 } }
+    if ($e -lt 0 -or $e -gt 6) { $e = 2 }
+    $cur = 'USD'
+    if ($currency) { $cur = [string]$currency }
+    # built from char codes so this file stays pure ASCII
+    switch ($cur) {
+        'USD'   { $sym = '$' }
+        'EUR'   { $sym = [string][char]0x20AC }
+        'GBP'   { $sym = [string][char]0x00A3 }
+        'JPY'   { $sym = [string][char]0x00A5 }
+        default { $sym = '' }
+    }
+    $num = ([double]$amount).ToString('N' + $e)
+    if ($sym) { return ($sym + $num) }
+    return ($num + ' ' + $cur)
+}
+
+# Reads either shape: the newer `spend` object (amount_minor/exponent) or the
+# older `extra_usage` (used_credits/monthly_limit scaled by decimal_places).
+function Get-SpendRow($d) {
+    $sp = $null
+    if ($d.PSObject.Properties.Name -contains 'spend') { $sp = $d.spend }
+    if ($sp -and $sp.PSObject.Properties.Name -contains 'enabled' -and $sp.enabled) {
+        $exp = $null; $cur = $null; $used = $null
+        if ($sp.PSObject.Properties.Name -contains 'used' -and $sp.used) {
+            $u = $sp.used
+            if ($u.PSObject.Properties.Name -contains 'exponent')     { $exp = $u.exponent }
+            if ($u.PSObject.Properties.Name -contains 'currency')     { $cur = $u.currency }
+            if ($u.PSObject.Properties.Name -contains 'amount_minor') { $used = ConvertFrom-MinorUnits $u.amount_minor $exp }
+        }
+        $limit = $null
+        if ($sp.PSObject.Properties.Name -contains 'limit' -and $null -ne $sp.limit) {
+            if ($sp.limit -is [System.Management.Automation.PSObject] -or $sp.limit -is [pscustomobject]) {
+                if ($sp.limit.PSObject.Properties.Name -contains 'amount_minor') { $limit = ConvertFrom-MinorUnits $sp.limit.amount_minor $exp }
+            } else { $limit = ConvertFrom-MinorUnits $sp.limit $exp }
+        }
+        $pct = 0
+        if ($sp.PSObject.Properties.Name -contains 'percent' -and $null -ne $sp.percent) { $pct = [double]$sp.percent }
+        $sev = ''
+        if ($sp.PSObject.Properties.Name -contains 'severity') { $sev = [string]$sp.severity }
+
+        $sub = 'extra usage'
+        if ($null -ne $used -and $null -ne $limit) { $sub = ('{0} of {1} this month' -f (Format-Money $used $cur $exp), (Format-Money $limit $cur $exp)) }
+        elseif ($null -ne $used)                   { $sub = ('{0} used this month'  -f (Format-Money $used $cur $exp)) }
+        return @{ Label = 'Extra usage'; Percent = $pct; Reset = $sub; Severity = $sev; Literal = $true }
+    }
+
+    if ($d.PSObject.Properties.Name -contains 'extra_usage' -and $d.extra_usage -and $d.extra_usage.is_enabled) {
+        $e2 = $d.extra_usage
+        $dp = $null; $cur = $null
+        if ($e2.PSObject.Properties.Name -contains 'decimal_places') { $dp  = $e2.decimal_places }
+        if ($e2.PSObject.Properties.Name -contains 'currency')       { $cur = $e2.currency }
+        $used = $null; $limit = $null
+        if ($e2.PSObject.Properties.Name -contains 'used_credits')  { $used  = ConvertFrom-MinorUnits $e2.used_credits  $dp }
+        if ($e2.PSObject.Properties.Name -contains 'monthly_limit') { $limit = ConvertFrom-MinorUnits $e2.monthly_limit $dp }
+        $pct = 0
+        if ($e2.PSObject.Properties.Name -contains 'utilization' -and $null -ne $e2.utilization) { $pct = ConvertTo-Percent $e2.utilization }
+
+        $sub = 'extra usage credits'
+        if ($null -ne $used -and $null -ne $limit) { $sub = ('{0} of {1} this month' -f (Format-Money $used $cur $dp), (Format-Money $limit $cur $dp)) }
+        elseif ($null -ne $used)                   { $sub = ('{0} used this month'  -f (Format-Money $used $cur $dp)) }
+        return @{ Label = 'Extra usage'; Percent = $pct; Reset = $sub; Severity = ''; Literal = $true }
+    }
+    return $null
+}
+
 function Get-ScopeName($l) {
     if ($l.PSObject.Properties.Name -notcontains 'scope' -or -not $l.scope) { return $null }
     $sc = $l.scope
@@ -395,17 +475,8 @@ function Get-LimitRows($d) {
         }
     }
 
-    if ($d.PSObject.Properties.Name -contains 'extra_usage' -and $d.extra_usage -and $d.extra_usage.is_enabled) {
-        $e = $d.extra_usage
-        $pct = 0
-        if ($e.PSObject.Properties.Name -contains 'utilization' -and $null -ne $e.utilization) { $pct = ConvertTo-Percent $e.utilization }
-        $sub = 'extra usage credits'
-        if ($e.PSObject.Properties.Name -contains 'used_credits' -and $null -ne $e.used_credits -and
-            $e.PSObject.Properties.Name -contains 'monthly_limit' -and $null -ne $e.monthly_limit) {
-            $sub = ('${0:0.00} of ${1:0.00} this month' -f [double]$e.used_credits, [double]$e.monthly_limit)
-        }
-        $rows.Add(@{ Label = 'Extra usage'; Percent = $pct; Reset = $sub; Severity = ''; Literal = $true })
-    }
+    $spendRow = Get-SpendRow $d
+    if ($spendRow) { $rows.Add($spendRow) }
     return $rows.ToArray()
 }
 
