@@ -142,6 +142,12 @@ right-click menu are always there. Closing shuts the process down completely.
 - Bars turn amber at 75% and red at 90%, or earlier if the server marks the limit
   warning/critical. Whichever is more severe wins.
 - A scoped weekly cap with no usage and no reset window is hidden until it applies.
+- Extra-usage money comes back in **minor units** (cents) with an explicit
+  `exponent` / `decimal_places`, so it is scaled down before display — reading it
+  raw shows every amount 100x too large. Both shapes are handled: the newer
+  `spend` object (`amount_minor` + `exponent`) and the older `extra_usage`
+  (`used_credits` / `monthly_limit` + `decimal_places`). Non-USD currencies and
+  zero-decimal currencies like JPY format correctly.
 - Each row shows the countdown plus the wall-clock time it lands on, in your own
   time zone and locale: "resets in 4h 25m (4:20 PM)" today, "(Tue 3:00 PM)" within
   the week, "(Sep 9 11:55 AM)" beyond it.
