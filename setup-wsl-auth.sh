@@ -64,7 +64,7 @@ def money(v, exp, cur='USD'):
     try: e=int(exp)
     except Exception: e=2
     if e<0 or e>6: e=2
-    sym={'USD':'$','EUR':'\\u20ac','GBP':'\\u00a3','JPY':'\\u00a5'}.get(cur or 'USD','')
+    sym={'USD':'$','EUR':chr(0x20ac),'GBP':chr(0xa3),'JPY':chr(0xa5)}.get(cur or 'USD','')
     amt=float(v)/(10**e)
     return f'{sym}{amt:,.{e}f}' if sym else f'{amt:,.{e}f} {cur}'
 sp=d.get('spend') or {}
