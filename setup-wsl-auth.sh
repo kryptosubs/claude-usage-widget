@@ -57,9 +57,33 @@ for label,k in rows:
     if p is None: continue
     bar='#'*int(p/5)+'.'*(20-int(p/5))
     print(f'  {label:<14} [{bar}] {p:5.1f}%   {when(w.get("resets_at"))}')
-e=d.get('extra_usage') or {}
-if e.get('is_enabled'):
-    print(f'  Extra usage    ${e.get("used_credits",0)} of ${e.get("monthly_limit",0)} this month')
+# money arrives in MINOR units (cents) with an explicit exponent/decimal_places;
+# reading it raw overstates every figure by 100x
+def money(v, exp, cur='USD'):
+    if v is None: return None
+    try: e=int(exp)
+    except Exception: e=2
+    if e<0 or e>6: e=2
+    sym={'USD':'$','EUR':'\\u20ac','GBP':'\\u00a3','JPY':'\\u00a5'}.get(cur or 'USD','')
+    amt=float(v)/(10**e)
+    return f'{sym}{amt:,.{e}f}' if sym else f'{amt:,.{e}f} {cur}'
+sp=d.get('spend') or {}
+if sp.get('enabled'):
+    u=sp.get('used') or {}
+    exp=u.get('exponent'); cur=u.get('currency')
+    used=money(u.get('amount_minor'), exp, cur)
+    lim=sp.get('limit')
+    if isinstance(lim,dict): lim=money(lim.get('amount_minor'), exp, cur)
+    elif lim is not None:    lim=money(lim, exp, cur)
+    if used and lim: print(f'  Extra usage    {used} of {lim} this month')
+    elif used:       print(f'  Extra usage    {used} used this month')
+else:
+    e=d.get('extra_usage') or {}
+    if e.get('is_enabled'):
+        dp=e.get('decimal_places'); cur=e.get('currency')
+        used=money(e.get('used_credits'), dp, cur); lim=money(e.get('monthly_limit'), dp, cur)
+        if used and lim: print(f'  Extra usage    {used} of {lim} this month')
+        elif used:       print(f'  Extra usage    {used} used this month')
 PY
 }
 
