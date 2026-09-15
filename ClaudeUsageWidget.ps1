@@ -158,6 +158,34 @@ function New-CredSource($label, $obj) {
     return @{ Label = $label; Oauth = $o; ExpiresAt = $exp; HasRefresh = $hasRefresh }
 }
 
+# Get-Usage rewraps its error to say WHICH call failed, which buries the original
+# WebException - the only object carrying .Response - one level down. Reading
+# $_.Exception.Response off the wrapper silently yields 0, so a usage 401 looked
+# like a generic failure: the widget showed 'offline' instead of 'auth' and skipped
+# the cache-clearing that lets it notice a fresh login. Walk the chain instead.
+function Get-HttpStatus($errRecord) {
+    if (-not $errRecord) { return 0 }
+    $ex = $errRecord
+    if ($errRecord.PSObject.Properties.Name -contains 'Exception') { $ex = $errRecord.Exception }
+    $depth = 0
+    while ($ex -and $depth -lt 6) {
+        try {
+            if ($ex.PSObject.Properties.Name -contains 'Response' -and $ex.Response) {
+                $r = $ex.Response
+                if ($r.PSObject.Properties.Name -contains 'StatusCode') { return [int]$r.StatusCode }
+            }
+        } catch { }
+        $ex = $ex.InnerException
+        $depth++
+    }
+    # last resort: both PowerShell editions put the code in the message text
+    $msg = ''
+    try { if ($errRecord.Exception) { $msg = [string]$errRecord.Exception.Message } } catch { }
+    if ($msg -match '\((\d{3})\)')      { return [int]$Matches[1] }
+    if ($msg -match '\b([45]\d{2})\b')  { return [int]$Matches[1] }
+    return 0
+}
+
 function Invoke-TokenRefresh([string]$RefreshToken) {
     $body = @{ grant_type = 'refresh_token'; refresh_token = $RefreshToken; client_id = $Script:ClientId } | ConvertTo-Json -Compress
     $last = $null
@@ -168,8 +196,7 @@ function Invoke-TokenRefresh([string]$RefreshToken) {
         }
         catch {
             $last = $_
-            $sc = 0
-            try { if ($_.Exception.Response) { $sc = [int]$_.Exception.Response.StatusCode } } catch { }
+            $sc = Get-HttpStatus $_
             # 400/401 means the endpoint is alive and rejected the token - trying the
             # other hosts would just repeat the same rejection
             if ($sc -eq 400 -or $sc -eq 401) { throw ('REFRESH_REJECTED:' + $sc) }
@@ -290,7 +317,9 @@ function Get-Usage {
                     -UserAgent $Script:UserAgent -TimeoutSec 15
     }
     catch {
-        # make it obvious which call failed - a bare '404' told us nothing useful
+        # make it obvious which call failed - a bare '404' told us nothing useful.
+        # The original exception is kept as InnerException; Get-HttpStatus digs the
+        # status back out of it, because this wrapper has no .Response of its own.
         throw (New-Object System.Exception (('usage endpoint: ' + $_.Exception.Message), $_.Exception))
     }
 }
@@ -580,8 +609,7 @@ function Invoke-Diagnose {
                 -UserAgent $Script:UserAgent -TimeoutSec 10 -UseBasicParsing | Out-Null
             Write-Host ("  {0}  reachable" -f $u)
         } catch {
-            $sc = 0
-            try { if ($_.Exception.Response) { $sc = [int]$_.Exception.Response.StatusCode } } catch { }
+            $sc = Get-HttpStatus $_
             if ($sc -eq 400 -or $sc -eq 401) { Write-Host ("  {0}  OK (alive, {1})" -f $u, $sc) -ForegroundColor Green }
             elseif ($sc -eq 404)             { Write-Host ("  {0}  404 - retired" -f $u) -ForegroundColor DarkGray }
             else                             { Write-Host ("  {0}  unreachable ({1})" -f $u, $_.Exception.Message) -ForegroundColor DarkGray }
@@ -615,8 +643,7 @@ function Invoke-Diagnose {
         }
     }
     catch {
-        $sc = 0
-        try { if ($_.Exception.Response) { $sc = [int]$_.Exception.Response.StatusCode } } catch { }
+        $sc = Get-HttpStatus $_
         Write-Host ("usage endpoint: FAILED  {0}" -f ($_.Exception.Message -replace '^usage endpoint: ', '')) -ForegroundColor Red
         if ($Script:UsedSource) { Write-Host ("  tried with: {0}" -f $Script:UsedSource) }
         if ($Script:LastRefreshError) { Write-Host ("  refresh error: {0}" -f $Script:LastRefreshError) -ForegroundColor Red }
@@ -822,8 +849,7 @@ function Update-Usage {
     }
     catch {
         $msg  = $_.Exception.Message
-        $code = 0
-        try { if ($_.Exception.Response) { $code = [int]$_.Exception.Response.StatusCode } } catch { }
+        $code = Get-HttpStatus $_
 
         if ($msg -eq 'NOTOKEN') {
             Show-Message "No Claude Code login found.`nRun `"claude`" once, then click to retry."
