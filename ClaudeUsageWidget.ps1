@@ -378,9 +378,9 @@ function Get-SpendRow($d) {
         if ($sp.PSObject.Properties.Name -contains 'severity') { $sev = [string]$sp.severity }
 
         $sub = 'extra usage'
-        if ($null -ne $used -and $null -ne $limit) { $sub = ('{0} of {1} this month' -f (Format-Money $used $cur $exp), (Format-Money $limit $cur $exp)) }
-        elseif ($null -ne $used)                   { $sub = ('{0} used this month'  -f (Format-Money $used $cur $exp)) }
-        return @{ Label = 'Extra usage'; Percent = $pct; Reset = $sub; Severity = $sev; Literal = $true }
+        if ($null -ne $used -and $null -ne $limit) { $sub = ('{0} / {1} mo' -f (Format-Money $used $cur $exp), (Format-Money $limit $cur $exp)) }
+        elseif ($null -ne $used)                   { $sub = ('{0} used'     -f (Format-Money $used $cur $exp)) }
+        return @{ Label = 'Extra usage'; Short = 'Extra'; Percent = $pct; Reset = $sub; Severity = $sev; Literal = $true }
     }
 
     if ($d.PSObject.Properties.Name -contains 'extra_usage' -and $d.extra_usage -and $d.extra_usage.is_enabled) {
@@ -395,9 +395,9 @@ function Get-SpendRow($d) {
         if ($e2.PSObject.Properties.Name -contains 'utilization' -and $null -ne $e2.utilization) { $pct = ConvertTo-Percent $e2.utilization }
 
         $sub = 'extra usage credits'
-        if ($null -ne $used -and $null -ne $limit) { $sub = ('{0} of {1} this month' -f (Format-Money $used $cur $dp), (Format-Money $limit $cur $dp)) }
-        elseif ($null -ne $used)                   { $sub = ('{0} used this month'  -f (Format-Money $used $cur $dp)) }
-        return @{ Label = 'Extra usage'; Percent = $pct; Reset = $sub; Severity = ''; Literal = $true }
+        if ($null -ne $used -and $null -ne $limit) { $sub = ('{0} / {1} mo' -f (Format-Money $used $cur $dp), (Format-Money $limit $cur $dp)) }
+        elseif ($null -ne $used)                   { $sub = ('{0} used'     -f (Format-Money $used $cur $dp)) }
+        return @{ Label = 'Extra usage'; Short = 'Extra'; Percent = $pct; Reset = $sub; Severity = ''; Literal = $true }
     }
     return $null
 }
@@ -441,27 +441,28 @@ function Get-LimitRows($d) {
             # a scoped cap with no usage and no window has not kicked in - showing it is noise
             if ($kind -eq 'weekly_scoped' -and $pct -le 0 -and -not $reset) { continue }
 
+            # Short is what the compact layout shows; Label is kept for -Diagnose
             switch ($kind) {
-                'session'       { $label = 'Session (5h)' }
-                'weekly_all'    { $label = 'Week (all models)' }
-                'weekly_scoped' { $label = 'Week' }
-                default         { $label = (Get-Culture).TextInfo.ToTitleCase(($kind -replace '_', ' ')) }
+                'session'       { $label = 'Session (5h)';      $short = '5h' }
+                'weekly_all'    { $label = 'Week (all models)'; $short = '7d' }
+                'weekly_scoped' { $label = 'Week';              $short = 'wk' }
+                default         { $label = (Get-Culture).TextInfo.ToTitleCase(($kind -replace '_', ' ')); $short = $label }
             }
             if ($kind -eq 'weekly_scoped') {
                 $n = Get-ScopeName $l
-                if ($n) { $label = 'Week - ' + $n }
+                if ($n) { $label = 'Week - ' + $n; $short = $n }
             }
-            $rows.Add(@{ Label = $label; Percent = $pct; Reset = $reset; Severity = $sev })
+            $rows.Add(@{ Label = $label; Short = $short; Percent = $pct; Reset = $reset; Severity = $sev })
             $fromLimits = $true
         }
     }
 
     if (-not $fromLimits) {
         $defs = @(
-            @{ Key = 'five_hour';        Label = 'Session (5h)' },
-            @{ Key = 'seven_day';        Label = 'Week (all models)' },
-            @{ Key = 'seven_day_opus';   Label = 'Week - Opus' },
-            @{ Key = 'seven_day_sonnet'; Label = 'Week - Sonnet' }
+            @{ Key = 'five_hour';        Label = 'Session (5h)';      Short = '5h' },
+            @{ Key = 'seven_day';        Label = 'Week (all models)'; Short = '7d' },
+            @{ Key = 'seven_day_opus';   Label = 'Week - Opus';       Short = 'Opus' },
+            @{ Key = 'seven_day_sonnet'; Label = 'Week - Sonnet';     Short = 'Sonnet' }
         )
         foreach ($def in $defs) {
             if ($d.PSObject.Properties.Name -notcontains $def.Key) { continue }
@@ -471,7 +472,7 @@ function Get-LimitRows($d) {
             if ($null -eq $pct) { continue }
             $reset = ''
             if ($w.PSObject.Properties.Name -contains 'resets_at') { $reset = [string]$w.resets_at }
-            $rows.Add(@{ Label = $def.Label; Percent = $pct; Reset = $reset; Severity = '' })
+            $rows.Add(@{ Label = $def.Label; Short = $def.Short; Percent = $pct; Reset = $reset; Severity = '' })
         }
     }
 
@@ -492,20 +493,27 @@ function ConvertTo-Percent($value) {
     return $v
 }
 
-function Format-Countdown([string]$iso) {
+function Format-Countdown([string]$iso, [switch]$Short) {
     if (-not $iso) { return '' }
     try {
         $t = [datetimeoffset]::Parse($iso, [Globalization.CultureInfo]::InvariantCulture,
                                     [Globalization.DateTimeStyles]::AssumeUniversal)
     } catch { return '' }
     $span = $t - [datetimeoffset]::UtcNow
-    if ($span.TotalSeconds -le 0) { return 'resetting...' }
+    if ($span.TotalSeconds -le 0) { if ($Short) { return 'resetting' } return 'resetting...' }
 
     # round the remainder UP to the next whole minute so a countdown never reads low
     $mins = [int][math]::Ceiling($span.TotalMinutes)
-    if ($mins -ge 1440)   { $rel = 'resets in {0}d {1}h' -f [int][math]::Floor($mins / 1440), [int][math]::Floor(($mins % 1440) / 60) }
-    elseif ($mins -ge 60) { $rel = 'resets in {0}h {1}m' -f [int][math]::Floor($mins / 60), ($mins % 60) }
-    else                  { $rel = 'resets in {0}m' -f $mins }
+    # -Short drops the 'resets in' words and the inner spaces: same numbers, ~40px less
+    if ($Short) {
+        if ($mins -ge 1440)   { $rel = '{0}d{1}h' -f [int][math]::Floor($mins / 1440), [int][math]::Floor(($mins % 1440) / 60) }
+        elseif ($mins -ge 60) { $rel = '{0}h{1}m' -f [int][math]::Floor($mins / 60), ($mins % 60) }
+        else                  { $rel = '{0}m' -f $mins }
+    } else {
+        if ($mins -ge 1440)   { $rel = 'resets in {0}d {1}h' -f [int][math]::Floor($mins / 1440), [int][math]::Floor(($mins % 1440) / 60) }
+        elseif ($mins -ge 60) { $rel = 'resets in {0}h {1}m' -f [int][math]::Floor($mins / 60), ($mins % 60) }
+        else                  { $rel = 'resets in {0}m' -f $mins }
+    }
 
     # ...plus the wall-clock time it lands on, in the viewer's own locale and zone
     $local = $t.ToLocalTime()
@@ -514,6 +522,7 @@ function Format-Countdown([string]$iso) {
     elseif ($local.Date -lt $today.AddDays(7))     { $abs = $local.ToString('ddd ') + $local.ToString('t') }
     else                                           { $abs = $local.ToString('MMM d ') + $local.ToString('t') }
 
+    if ($Short) { return ('{0}  {1}' -f $rel, $abs) }
     return ('{0} ({1})' -f $rel, $abs)
 }
 
@@ -631,30 +640,30 @@ if ($Diagnose) { Invoke-Diagnose; return }
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="Claude Usage" WindowStyle="None" AllowsTransparency="True" Background="Transparent"
-        Topmost="True" ShowInTaskbar="False" SizeToContent="Height" Width="292"
+        Topmost="True" ShowInTaskbar="False" SizeToContent="Height" Width="224"
         WindowStartupLocation="Manual" ResizeMode="NoResize">
-  <Border CornerRadius="14" Background="#F21B1B1F" BorderBrush="#26FFFFFF" BorderThickness="1" Padding="14,12,14,13">
+  <Border CornerRadius="10" Background="#F21B1B1F" BorderBrush="#26FFFFFF" BorderThickness="1" Padding="10,7,10,8">
     <StackPanel>
-      <Grid Margin="0,0,0,10">
+      <!-- one header line: identity on the left, status and close on the right -->
+      <Grid Margin="0,0,0,5">
         <Grid.ColumnDefinitions>
           <ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/><ColumnDefinition Width="Auto"/>
         </Grid.ColumnDefinitions>
-        <TextBlock Grid.Column="0" Text="CLAUDE USAGE" Foreground="#FFFFFF" FontFamily="Segoe UI"
-                   FontSize="11" FontWeight="SemiBold" Opacity="0.92" VerticalAlignment="Center"/>
+        <TextBlock Grid.Column="0" x:Name="AccountText" Text="Claude Usage" Foreground="#8A8A95"
+                   FontFamily="Segoe UI" FontSize="10" VerticalAlignment="Center"
+                   TextTrimming="CharacterEllipsis"/>
         <TextBlock Grid.Column="1" x:Name="StatusText" Text="" Foreground="#9A9AA5" FontFamily="Segoe UI"
-                   FontSize="10" VerticalAlignment="Center"/>
+                   FontSize="9" VerticalAlignment="Center" Margin="6,0,0,0"/>
         <!-- Background must be a real brush, not null, or it will not be hit-testable -->
-        <Border Grid.Column="2" x:Name="CloseBtn" Background="#00FFFFFF" Cursor="Hand" CornerRadius="4"
-                Margin="9,-3,-4,-3" Padding="6,2,6,3" ToolTip="Close (Esc)" VerticalAlignment="Center">
+        <Border Grid.Column="2" x:Name="CloseBtn" Background="#00FFFFFF" Cursor="Hand" CornerRadius="3"
+                Margin="5,-2,-3,-2" Padding="5,1,5,2" ToolTip="Close (Esc)" VerticalAlignment="Center">
           <TextBlock x:Name="CloseGlyph" Text="&#x2715;" Foreground="#8A8A95" FontFamily="Segoe UI"
-                     FontSize="11" VerticalAlignment="Center"/>
+                     FontSize="10" VerticalAlignment="Center"/>
         </Border>
       </Grid>
-      <TextBlock x:Name="AccountText" Text="" Foreground="#8A8A95" FontFamily="Segoe UI" FontSize="10"
-                 Margin="0,-6,0,9" TextTrimming="CharacterEllipsis" Visibility="Collapsed"/>
       <StackPanel x:Name="Rows"/>
-      <TextBlock x:Name="HintText" Text="" Foreground="#8A8A95" FontFamily="Segoe UI" FontSize="10"
-                 TextWrapping="Wrap" Margin="0,8,0,0" Visibility="Collapsed"/>
+      <TextBlock x:Name="HintText" Text="" Foreground="#8A8A95" FontFamily="Segoe UI" FontSize="9"
+                 TextWrapping="Wrap" Margin="0,5,0,0" Visibility="Collapsed"/>
     </StackPanel>
   </Border>
 </Window>
@@ -675,7 +684,7 @@ if ($null -ne $Script:State.Left -and $null -ne $Script:State.Top) {
     $win.Left = [double]$Script:State.Left; $win.Top = [double]$Script:State.Top
 } else {
     $wa = [System.Windows.SystemParameters]::WorkArea
-    $win.Left = $wa.Right - 312; $win.Top = $wa.Top + 20
+    $win.Left = $wa.Right - 244; $win.Top = $wa.Top + 20   # card is 224 wide + 20 margin
 }
 
 
@@ -693,7 +702,9 @@ function Th($l, $t, $r, $b) { return (New-Object System.Windows.Thickness ([doub
 function CR([double]$r)     { return (New-Object System.Windows.CornerRadius $r) }
 function FF([string]$n)     { return (New-Object System.Windows.Media.FontFamily $n) }
 
-$BarWidth = 264.0
+$RowWidth  = 204.0   # content width inside the card (card 224 - 2x10 padding)
+$RowHeight = 18.0
+
 function Get-BarColour($percent, $severity) {
     $rank = 0
     $p = [double]$percent
@@ -706,44 +717,54 @@ function Get-BarColour($percent, $severity) {
     switch ($rank) { 2 { return '#F87171' } 1 { return '#FBBF24' } default { return '#4ADE80' } }
 }
 
-function New-UsageRow($label, $percent, $reset, $severity) {
-    $sp = New-Object Windows.Controls.StackPanel
-    $sp.Margin = (Th 0 0 0 11)
-
+# Compact row: label, percent and reset sit on ONE line, and the progress bar is
+# painted behind them instead of occupying its own line and its own column. That
+# removes two of the three lines each metric used to take.
+function New-UsageRow($label, $percent, $reset, $severity, $short) {
     $g = New-Object Windows.Controls.Grid
-    $c1 = New-Object Windows.Controls.ColumnDefinition; $c1.Width = [System.Windows.GridLength]::Auto
-    $c2 = New-Object Windows.Controls.ColumnDefinition
-    $c3 = New-Object Windows.Controls.ColumnDefinition; $c3.Width = [System.Windows.GridLength]::Auto
-    $g.ColumnDefinitions.Add($c1); $g.ColumnDefinitions.Add($c2); $g.ColumnDefinitions.Add($c3)
-
-    $lb = New-Object Windows.Controls.TextBlock
-    $lb.Text = $label; $lb.FontFamily = (FF 'Segoe UI'); $lb.FontSize = 12
-    $lb.Foreground = (B '#E6E6EC')
-    [Windows.Controls.Grid]::SetColumn($lb, 0); $g.Children.Add($lb) | Out-Null
-
-    $pv = New-Object Windows.Controls.TextBlock
-    $pv.Text = ('{0:0}%' -f $percent); $pv.FontFamily = (FF 'Segoe UI'); $pv.FontSize = 12
-    $pv.FontWeight = [System.Windows.FontWeights]::SemiBold; $pv.Foreground = (B '#FFFFFF')
-    [Windows.Controls.Grid]::SetColumn($pv, 2); $g.Children.Add($pv) | Out-Null
-    $sp.Children.Add($g) | Out-Null
+    $g.Height = $RowHeight
+    $g.Margin = (Th 0 0 0 3)
 
     $track = New-Object Windows.Controls.Border
-    $track.Height = 5; $track.CornerRadius = (CR 3); $track.Background = (B '#1FFFFFFF')
-    $track.Margin = (Th 0 5 0 0); $track.HorizontalAlignment = 'Left'; $track.Width = $BarWidth
+    $track.CornerRadius = (CR 4); $track.Background = (B '#14FFFFFF')
+    $g.Children.Add($track) | Out-Null
 
-    $fill = New-Object Windows.Controls.Border
-    $fill.Height = 5; $fill.CornerRadius = (CR 3); $fill.HorizontalAlignment = 'Left'
     $p = [math]::Max(0, [math]::Min(100, [double]$percent))
-    $fill.Width = [math]::Max(3, $BarWidth * $p / 100)
-    $fill.Background = (B (Get-BarColour $p $severity))
-    $track.Child = $fill
-    $sp.Children.Add($track) | Out-Null
+    $fill = New-Object Windows.Controls.Border
+    $fill.CornerRadius = (CR 4); $fill.HorizontalAlignment = 'Left'
+    $fill.Width = [math]::Max(2, $RowWidth * $p / 100)
+    # same hue as before at ~35% alpha, so the text on top stays readable
+    $fill.Background = (B ('#59' + (Get-BarColour $p $severity).Substring(1)))
+    $g.Children.Add($fill) | Out-Null
+
+    $inner = New-Object Windows.Controls.Grid
+    $inner.Margin = (Th 7 0 7 0)
+    foreach ($w in @('Auto','Auto','*','Auto')) {
+        $cd = New-Object Windows.Controls.ColumnDefinition
+        if ($w -eq 'Auto') { $cd.Width = [System.Windows.GridLength]::Auto }
+        $inner.ColumnDefinitions.Add($cd)
+    }
+
+    $lb = New-Object Windows.Controls.TextBlock
+    $lb.Text = $short; $lb.FontFamily = (FF 'Segoe UI'); $lb.FontSize = 11
+    $lb.Foreground = (B '#D8D8E0'); $lb.VerticalAlignment = 'Center'
+    [Windows.Controls.Grid]::SetColumn($lb, 0); $inner.Children.Add($lb) | Out-Null
+
+    $pv = New-Object Windows.Controls.TextBlock
+    $pv.Text = ('{0:0}%' -f $percent); $pv.FontFamily = (FF 'Segoe UI'); $pv.FontSize = 11
+    $pv.FontWeight = [System.Windows.FontWeights]::SemiBold; $pv.Foreground = (B '#FFFFFF')
+    $pv.VerticalAlignment = 'Center'; $pv.Margin = (Th 6 0 0 0)
+    [Windows.Controls.Grid]::SetColumn($pv, 1); $inner.Children.Add($pv) | Out-Null
 
     $rs = New-Object Windows.Controls.TextBlock
     $rs.Text = $reset; $rs.FontFamily = (FF 'Segoe UI'); $rs.FontSize = 10
-    $rs.Foreground = (B '#8A8A95'); $rs.Margin = (Th 0 4 0 0)
-    $sp.Children.Add($rs) | Out-Null
-    return $sp
+    $rs.Foreground = (B '#A8A8B4'); $rs.VerticalAlignment = 'Center'
+    $rs.TextTrimming = 'CharacterEllipsis'; $rs.Margin = (Th 6 0 0 0)
+    $rs.ToolTip = ('{0} - {1}' -f $label, $reset)     # full label still reachable
+    [Windows.Controls.Grid]::SetColumn($rs, 3); $inner.Children.Add($rs) | Out-Null
+
+    $g.Children.Add($inner) | Out-Null
+    return $g
 }
 
 function Show-Message([string]$text) {
@@ -769,11 +790,13 @@ function Render {
 
     foreach ($r in @(Get-LimitRows $d)) {
         $reset = $r.Reset
-        if (-not $r.ContainsKey('Literal')) { $reset = Format-Countdown $r.Reset }
-        $rows.Children.Add((New-UsageRow $r.Label $r.Percent $reset $r.Severity)) | Out-Null
+        if (-not $r.ContainsKey('Literal')) { $reset = Format-Countdown $r.Reset -Short }
+        $short = $r.Label
+        if ($r.ContainsKey('Short') -and $r.Short) { $short = $r.Short }
+        $rows.Children.Add((New-UsageRow $r.Label $r.Percent $reset $r.Severity $short)) | Out-Null
     }
 
-    if ($rows.Children.Count -eq 0) { Show-Message 'No usage windows reported for this account.' }
+    if ($rows.Children.Count -eq 0) { Show-Message 'No usage windows reported.' }
 
     if ($Script:LastOk) {
         $age = [int]([datetime]::UtcNow - $Script:LastOk).TotalSeconds
@@ -791,7 +814,7 @@ function Update-Usage {
         if (-not $Script:Account) {
             try {
                 $Script:Account = Get-ProfileEmail (Get-Profile)
-                if ($Script:Account) { $accountText.Text = $Script:Account; $accountText.Visibility = 'Visible' }
+                if ($Script:Account) { $accountText.Text = $Script:Account }
             } catch { }   # cosmetic only - never let this break the usage display
         }
         $hintText.Visibility = 'Collapsed'
@@ -803,7 +826,7 @@ function Update-Usage {
         try { if ($_.Exception.Response) { $code = [int]$_.Exception.Response.StatusCode } } catch { }
 
         if ($msg -eq 'NOTOKEN') {
-            Show-Message "Couldn't find a Claude Code login on this PC.`n`nRun `"claude`" once in your terminal (Windows or WSL) to sign in, then click this widget to retry."
+            Show-Message "No Claude Code login found.`nRun `"claude`" once, then click to retry."
             $statusText.Text = 'no token'; $statusText.Foreground = (B '#F87171')
             $Script:Backoff = 4
             return
@@ -812,18 +835,19 @@ function Update-Usage {
             $Script:CredSources = $null            # re-scan: the user may have just logged in
             $Script:State.CachedToken = $null
             $Script:Account = $null
-            $hintText.Text = 'Login expired - run /login in Claude Code, or set CLAUDE_CODE_OAUTH_TOKEN (see README).'
+            $accountText.Text = 'Claude Usage'
+            $hintText.Text = 'Login expired - run /login in Claude Code.'
             $hintText.Visibility = 'Visible'
             $statusText.Text = 'auth'; $statusText.Foreground = (B '#F87171')
         }
         elseif ($code -eq 429) {
-            $hintText.Text = 'Rate limited by the usage API - backing off.'
+            $hintText.Text = 'Rate limited - backing off.'
             $hintText.Visibility = 'Visible'
             $statusText.Text = 'throttled'; $statusText.Foreground = (B '#FBBF24')
         }
         else {
             if ($Script:LastRefreshError) { $msg = ('{0} / refresh: {1}' -f $msg, $Script:LastRefreshError) }
-            $hintText.Text = ('Fetch failed: {0}  -  run with -Diagnose for detail' -f $msg)
+            $hintText.Text = ('Fetch failed - run Diagnose.cmd. ({0})' -f $msg)
             $hintText.Visibility = 'Visible'
             $statusText.Text = 'offline'; $statusText.Foreground = (B '#FBBF24')
         }

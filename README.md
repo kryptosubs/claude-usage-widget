@@ -112,8 +112,16 @@ served the request, the account email, and the raw usage response.
 
 ## Controls
 
+The layout is deliberately compact: each limit is one 18px line where the progress
+bar is painted *behind* the text rather than sitting on its own line, so a metric
+costs one line instead of three. Labels are abbreviated (`5h`, `7d`, `Opus`) and the
+account email doubles as the title. Hovering a row shows the full label and reset
+time. The card is 224x96 for three limits, down from 292x211 - about a third of the
+former area, with the same information on screen.
+
 | Action | Result |
 | --- | --- |
+| Hover a row | Full label and reset time |
 | **X button** (top right) | Close the widget and quit |
 | **Esc** | Same |
 | Right-click the widget | Refresh, hide to tray, close |
@@ -149,8 +157,8 @@ right-click menu are always there. Closing shuts the process down completely.
   (`used_credits` / `monthly_limit` + `decimal_places`). Non-USD currencies and
   zero-decimal currencies like JPY format correctly.
 - Each row shows the countdown plus the wall-clock time it lands on, in your own
-  time zone and locale: "resets in 4h 25m (4:20 PM)" today, "(Tue 3:00 PM)" within
-  the week, "(Sep 9 11:55 AM)" beyond it.
+  time zone and locale. The widget uses the compact form (`4h25m  4:20 PM`);
+  `Diagnose.cmd` prints the long form (`resets in 4h 25m (4:20 PM)`).
 - Settings, window position and the renewed credential live in `widget-state.json`
   beside the script (owner-only ACL; never commit it).
 - `/api/oauth/usage` is undocumented and used internally by Claude Code's own usage
