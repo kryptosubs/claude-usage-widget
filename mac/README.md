@@ -17,8 +17,10 @@ cd mac
 ```
 
 Look for a small ring and a percentage in the menu bar. There is no Dock icon.
-Open the gear menu in the popover and turn on **Launch at login** so it starts
-with the Mac.
+The first launch also opens the floating card, so you can see it working.
+Launching the app again while it is running opens the popover (or the card, if
+the menu bar is hiding the ring). Open the gear menu in the popover and turn on
+**Launch at login** so it starts with the Mac.
 
 Other build modes: `./build.sh` (build only), `./build.sh --test` (run the logic
 tests), `./build.sh --universal` (Apple silicon + Intel binary).
@@ -98,6 +100,7 @@ response.
   units and gets scaled by its exponent.
 - `--snapshot <dir>` renders the popover and widget to PNGs in both languages
   from live data, which is handy for checking layout without clicking anything.
+- Startup events go to `~/Library/Logs/ClaudeUsage.log` (never tokens).
 - Settings live in the app's standard defaults (`com.kryptohead.claude-usage`).
   No token is ever written to disk outside the Keychain or Claude Code's own file.
 

@@ -9,6 +9,16 @@ Both languages of that card live in `cards.ts`; the `components/i18n.tsx` half
 this note used to point at was removed, because keeping two files in step by
 hand is what produced a version bumped on one side only.
 
+## v1.2.1 — 2026-09-22
+
+**Fixed (Mac): launching the app could look like nothing happened.** It is a
+menu-bar-only app with no Dock icon and no window, so a launch while it was
+already running did nothing visible, and a ring hidden by a crowded menu bar
+looked the same as no app at all. Now a second launch hands over to the running
+instance, which opens its popover, or opens the floating card when the menu-bar
+item is not on screen. The first launch always shows the card, and there is only
+ever one instance. Startup events are logged to `~/Library/Logs/ClaudeUsage.log`.
+
 ## v1.2 — 2026-09-22
 
 **macOS version** (`mac/`). A native Swift menu-bar app built with nothing
