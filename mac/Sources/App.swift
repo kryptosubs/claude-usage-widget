@@ -41,6 +41,11 @@ final class Settings {
             else { d.removeObject(forKey: "widgetX"); d.removeObject(forKey: "widgetY") }
         }
     }
+    /// Floating card stays above other apps' windows (default on, like Windows).
+    static var widgetOnTop: Bool {
+        get { d.object(forKey: "widgetOnTop") == nil ? true : d.bool(forKey: "widgetOnTop") }
+        set { d.set(newValue, forKey: "widgetOnTop") }
+    }
     static var launchedBefore: Bool {
         get { d.bool(forKey: "launchedBefore") }
         set { d.set(newValue, forKey: "launchedBefore") }
@@ -302,7 +307,9 @@ struct PopoverView: View {
                         get: { model.lang }, set: { model.setLang($0) })) {
                         ForEach(Lang.allCases, id: \.self) { Text($0.displayName).tag($0) }
                     }
-                    Toggle(T("Launch at login", "登入時啟動"), isOn: Binding(
+                    Toggle(T("Keep widget on top", "小工具保持在最上層"), isOn: Binding(
+                        get: { Settings.widgetOnTop }, set: { app.setWidgetOnTop($0) }))
+                    Toggle(T("Open at login", "開機登入時啟動"), isOn: Binding(
                         get: { app.launchAtLogin }, set: { app.setLaunchAtLogin($0) }))
                     Divider()
                     Button(T("Copy diagnostics", "複製診斷資訊")) { app.copyDiagnostics() }
@@ -328,8 +335,20 @@ struct WidgetView: View {
         UsageCard(model: model, compact: true, onClose: { app.toggleWidget() })
             .background(RoundedRectangle(cornerRadius: 10).fill(Palette.card.opacity(0.95)))
             .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.white.opacity(0.15), lineWidth: 1))
+            .contentShape(RoundedRectangle(cornerRadius: 10))
+            // Drag anywhere on the card to move it. SwiftUI's hosting view swallows the
+            // mouse-down that isMovableByWindowBackground relies on, so the window is
+            // moved by hand, from the global mouse position (the view's own coordinate
+            // space moves with the window and would make the drag jitter).
+            .gesture(DragGesture(minimumDistance: 2)
+                .onChanged { _ in app.dragWidget() }
+                .onEnded { _ in app.endWidgetDrag() })
             .contextMenu {
                 Button(T("Refresh now", "立即更新")) { model.refreshNow() }
+                Toggle(T("Keep on top", "保持在最上層"), isOn: Binding(
+                    get: { Settings.widgetOnTop }, set: { app.setWidgetOnTop($0) }))
+                Toggle(T("Open at login", "開機登入時啟動"), isOn: Binding(
+                    get: { app.launchAtLogin }, set: { app.setLaunchAtLogin($0) }))
                 Button(T("Toggle transparency", "切換透明度")) { app.toggleOpacity() }
                 Button(T("Hide widget", "隱藏小工具")) { app.toggleWidget() }
                 Divider()
@@ -342,6 +361,12 @@ struct WidgetView: View {
 
 final class WidgetPanel: NSPanel {
     override var canBecomeKey: Bool { true }
+    /// When "Keep on top" is off the card is an ordinary window: clicking it brings
+    /// it forward, and other apps' windows can cover it again.
+    override func sendEvent(_ event: NSEvent) {
+        if event.type == .leftMouseDown || event.type == .rightMouseDown { orderFrontRegardless() }
+        super.sendEvent(event)
+    }
 }
 
 // MARK: - app delegate
@@ -480,10 +505,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             let p = WidgetPanel(contentRect: NSRect(x: 0, y: 0, width: 224, height: 100),
                                 styleMask: [.borderless, .nonactivatingPanel],
                                 backing: .buffered, defer: false)
-            p.level = .floating
-            p.isFloatingPanel = true
+            p.level = Settings.widgetOnTop ? .floating : .normal
+            p.isFloatingPanel = Settings.widgetOnTop
             p.hidesOnDeactivate = false
-            p.isMovableByWindowBackground = true
+            p.isMovableByWindowBackground = false      // moved by dragWidget() instead
             p.backgroundColor = .clear
             p.isOpaque = false
             p.hasShadow = true
@@ -514,6 +539,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         p.setFrame(NSRect(x: p.frame.minX, y: top - size.height, width: size.width, height: size.height), display: true)
     }
 
+    private var dragAnchor: (mouse: NSPoint, origin: NSPoint)?
+
+    func dragWidget() {
+        guard let p = panel else { return }
+        let m = NSEvent.mouseLocation
+        if dragAnchor == nil { dragAnchor = (m, p.frame.origin) }
+        guard let a = dragAnchor else { return }
+        p.setFrameOrigin(NSPoint(x: a.origin.x + m.x - a.mouse.x, y: a.origin.y + m.y - a.mouse.y))
+    }
+
+    func endWidgetDrag() {
+        dragAnchor = nil
+        if let p = panel { Settings.widgetOrigin = p.frame.origin }
+        Log.write("widget moved to \(panel.map { NSStringFromPoint($0.frame.origin) } ?? "-")")
+    }
+
+    func setWidgetOnTop(_ on: Bool) {
+        Settings.widgetOnTop = on
+        panel?.level = on ? .floating : .normal
+        panel?.isFloatingPanel = on
+        panel?.orderFrontRegardless()
+        Log.write("widget on top: \(on)")
+    }
+
     func toggleOpacity() {
         let v = (panel?.alphaValue ?? 1) > 0.8 ? 0.62 : 0.95
         panel?.alphaValue = v
@@ -526,18 +575,56 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     // --- misc
 
-    var launchAtLogin: Bool { SMAppService.mainApp.status == .enabled }
+    // Open at login: SMAppService first (shows up under System Settings > General >
+    // Login Items). An ad-hoc-signed build can be refused by it, so the fallback is a
+    // plain LaunchAgent in ~/Library/LaunchAgents, which needs no signature at all.
+    static let agentURL = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent("Library/LaunchAgents/com.kryptohead.claude-usage.plist")
+
+    var launchAtLogin: Bool {
+        SMAppService.mainApp.status == .enabled || FileManager.default.fileExists(atPath: Self.agentURL.path)
+    }
 
     func setLaunchAtLogin(_ on: Bool) {
+        if on {
+            do {
+                try SMAppService.mainApp.register()
+                Log.write("open at login: SMAppService registered")
+            } catch {
+                Log.write("open at login: SMAppService refused (\(error.localizedDescription)); using LaunchAgent")
+                if !writeLaunchAgent() {
+                    let a = NSAlert()
+                    a.messageText = T("Could not turn on Open at Login", "無法開啟「開機登入時啟動」")
+                    a.informativeText = T("Add Claude Usage in System Settings > General > Login Items.",
+                                          "請在 System Settings > General > Login Items 手動加入 Claude Usage。")
+                    a.runModal()
+                }
+            }
+        } else {
+            try? SMAppService.mainApp.unregister()
+            try? FileManager.default.removeItem(at: Self.agentURL)
+            Log.write("open at login: off")
+        }
+    }
+
+    private func writeLaunchAgent() -> Bool {
+        guard let exe = Bundle.main.executablePath else { return false }
+        let plist: [String: Any] = [
+            "Label": "com.kryptohead.claude-usage",
+            "ProgramArguments": [exe],
+            "RunAtLoad": true,
+            "ProcessType": "Interactive",
+        ]
         do {
-            if on { try SMAppService.mainApp.register() } else { try SMAppService.mainApp.unregister() }
+            try FileManager.default.createDirectory(at: Self.agentURL.deletingLastPathComponent(),
+                                                    withIntermediateDirectories: true)
+            let data = try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0)
+            try data.write(to: Self.agentURL, options: .atomic)
+            Log.write("open at login: LaunchAgent written")
+            return true
         } catch {
-            let a = NSAlert()
-            a.messageText = T("Could not change Launch at Login", "無法變更登入時啟動")
-            a.informativeText = error.localizedDescription + "\n\n" +
-                T("Move the app into Applications and try again, or add it in System Settings > General > Login Items.",
-                  "請將 App 移到「應用程式」資料夾再試，或在 System Settings > General > Login Items 手動加入。")
-            a.runModal()
+            Log.write("open at login: LaunchAgent failed (\(error.localizedDescription))")
+            return false
         }
     }
 
@@ -588,6 +675,15 @@ enum Main {
                 sem.signal()
             }
             sem.wait()
+            exit(0)
+        }
+        if CommandLine.arguments.contains("--check-login-item") {
+            // Round-trips Open at Login and leaves it off: proves the toggle works here.
+            let d = AppDelegate()
+            d.setLaunchAtLogin(true)
+            print("after on:  smapp=\(SMAppService.mainApp.status.rawValue) agent=\(FileManager.default.fileExists(atPath: AppDelegate.agentURL.path)) -> \(d.launchAtLogin)")
+            d.setLaunchAtLogin(false)
+            print("after off: smapp=\(SMAppService.mainApp.status.rawValue) agent=\(FileManager.default.fileExists(atPath: AppDelegate.agentURL.path)) -> \(d.launchAtLogin)")
             exit(0)
         }
         if let i = CommandLine.arguments.firstIndex(of: "--snapshot"), i + 1 < CommandLine.arguments.count {
