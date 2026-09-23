@@ -9,6 +9,36 @@ Both languages of that card live in `cards.ts`; the `components/i18n.tsx` half
 this note used to point at was removed, because keeping two files in step by
 hand is what produced a version bumped on one side only.
 
+## v1.2 — 2026-09-22
+
+**macOS version** (`mac/`). A native Swift menu-bar app built with nothing
+but the Xcode Command Line Tools (`./build.sh --install`). It adds a ring and a
+percentage to the menu bar, a popover with every limit, and an optional floating
+card that reproduces the Windows compact rows at the same 224pt width. It reads
+Claude Code's login from the macOS Keychain (`Claude Code-credentials`, through
+`/usr/bin/security`, so there is no access prompt) or from
+`~/.claude/.credentials.json`, ranked by expiry as on Windows. English and
+Traditional Chinese, switchable from the gear menu. Launch at login uses
+`SMAppService`.
+
+**On the Mac, refreshed tokens are written back.** Refresh tokens rotate, so a
+widget that keeps its own copy (the Windows approach) logs Claude Code out the
+first time it refreshes. The Mac app writes the new pair back into the source
+it read, changing only the token fields, so both clients stay on one chain. A
+refresh happens only after the access token has expired, and never twice in
+parallel: token resolution is single-flight, because a second concurrent refresh
+would spend the same rotating token. If the write-back fails, the new refresh
+token goes into the app's own Keychain item and is tried first next time.
+
+52 checks run under `./build.sh --test`. They include a stub token server that
+rotates tokens like the real one: three consecutive refreshes succeed, the
+chain is written back, the fallback copy is used when a write-back fails, and
+parallel callers share one refresh. The network is stubbed at the transport
+layer, never at our own functions. The build was verified on macOS 27 (Apple
+silicon) against the live endpoint.
+
+The Windows widget is unchanged in this release.
+
 ## v1.1 — 2026-09-15
 
 **Compact layout.** Each limit used three stacked lines — label and percent,
