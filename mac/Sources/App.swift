@@ -372,7 +372,7 @@ final class WidgetPanel: NSPanel {
 // MARK: - app delegate
 
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPopoverDelegate {
     let model = UsageModel()
     var statusItem: NSStatusItem!
     let popover = NSPopover()
@@ -391,6 +391,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         popover.behavior = .transient
         popover.animates = false
+        popover.delegate = self
         popover.appearance = NSAppearance(named: .darkAqua)
         popover.contentViewController = NSHostingController(rootView: PopoverView(model: model, app: self))
 
@@ -492,6 +493,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         popover.contentViewController?.view.window?.makeKey()
     }
 
+    /// Dragging the popover tears it off into its own window, which can then be
+    /// moved anywhere like any other window (the standard macOS behaviour).
+    func popoverShouldDetach(_ popover: NSPopover) -> Bool { true }
+
+    func popoverDidDetach(_ popover: NSPopover) {
+        guard let w = popover.contentViewController?.view.window else { return }
+        w.level = Settings.widgetOnTop ? .floating : .normal
+        w.collectionBehavior.insert(.canJoinAllSpaces)
+        Log.write("popover detached into a window")
+    }
+
     // --- floating widget
 
     func toggleWidget() {
@@ -560,6 +572,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         panel?.level = on ? .floating : .normal
         panel?.isFloatingPanel = on
         panel?.orderFrontRegardless()
+        if popover.isDetached, let w = popover.contentViewController?.view.window {
+            w.level = on ? .floating : .normal
+        }
         Log.write("widget on top: \(on)")
     }
 
