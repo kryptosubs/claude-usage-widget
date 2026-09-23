@@ -41,6 +41,10 @@ final class Settings {
             else { d.removeObject(forKey: "widgetX"); d.removeObject(forKey: "widgetY") }
         }
     }
+    static var launchedBefore: Bool {
+        get { d.bool(forKey: "launchedBefore") }
+        set { d.set(newValue, forKey: "launchedBefore") }
+    }
     static var widgetOpacity: Double {
         get { d.object(forKey: "opacity") == nil ? 0.95 : d.double(forKey: "opacity") }
         set { d.set(newValue, forKey: "opacity") }
@@ -367,8 +371,52 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         model.onChange = { [weak self] in self?.updateStatusItem(); self?.fitPanel() }
         model.start()
-        if Settings.showWidget { showWidget() }
         updateStatusItem()
+
+        // A second launch (Finder, Spotlight, Launchpad) asks this instance to show itself.
+        DistributedNotificationCenter.default().addObserver(
+            forName: Main.showNotification, object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor in self?.reveal() }
+        }
+
+        // A menu-bar-only app gives no sign of life on its own, and the menu bar may
+        // hide the item (too many icons, or System Settings > Menu Bar). So the first
+        // launch always shows the floating card, and so does any launch where the
+        // menu-bar item turns out not to be on screen.
+        let first = !Settings.launchedBefore
+        Settings.launchedBefore = true
+        if Settings.showWidget || first { showWidget() }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+            guard let self else { return }
+            Log.write("launched; status item on screen: \(self.statusItemOnScreen)")
+            if !self.statusItemOnScreen && !self.widgetVisible { self.showWidget() }
+        }
+    }
+
+    /// Double-clicking the app while it is already running.
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        reveal()
+        return false
+    }
+
+    /// Whether the menu-bar item is actually visible, not just created.
+    var statusItemOnScreen: Bool {
+        guard statusItem.isVisible, let w = statusItem.button?.window else { return false }
+        guard w.occlusionState.contains(.visible) else { return false }
+        return NSScreen.screens.contains { $0.frame.intersects(w.frame) }
+    }
+
+    /// Show something: the popover under the menu-bar item if it is visible,
+    /// otherwise the floating card.
+    func reveal() {
+        Log.write("reveal; status item on screen: \(statusItemOnScreen)")
+        if statusItemOnScreen, let b = statusItem.button {
+            NSApp.activate(ignoringOtherApps: true)
+            if !popover.isShown { popover.show(relativeTo: b.bounds, of: b, preferredEdge: .minY) }
+            popover.contentViewController?.view.window?.makeKey()
+        } else {
+            showWidget()
+        }
     }
 
     // --- menu bar
@@ -510,9 +558,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
 // MARK: - entry point
 
+/// Tiny append-only log: ~/Library/Logs/ClaudeUsage.log (no tokens ever go here).
+enum Log {
+    static let url = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent("Library/Logs/ClaudeUsage.log")
+    static func write(_ msg: String) {
+        let line = "\(ISO8601DateFormatter().string(from: Date())) \(msg)\n"
+        guard let data = line.data(using: .utf8) else { return }
+        if let h = try? FileHandle(forWritingTo: url) {
+            h.seekToEndOfFile(); h.write(data); try? h.close()
+        } else {
+            try? data.write(to: url)
+        }
+    }
+}
+
 @main
 @MainActor
 enum Main {
+    static let showNotification = Notification.Name("com.kryptohead.claude-usage.show")
     static func main() {
         if CommandLine.arguments.contains("--diagnose") {
             Lang.current = .en
@@ -529,6 +593,16 @@ enum Main {
         if let i = CommandLine.arguments.firstIndex(of: "--snapshot"), i + 1 < CommandLine.arguments.count {
             snapshot(to: CommandLine.arguments[i + 1]); exit(0)
         }
+        // One instance only: a second launch hands over to the running one and quits.
+        let me = ProcessInfo.processInfo.processIdentifier
+        if let id = Bundle.main.bundleIdentifier,
+           NSRunningApplication.runningApplications(withBundleIdentifier: id).contains(where: { $0.processIdentifier != me }) {
+            Log.write("already running; asking it to show itself")
+            DistributedNotificationCenter.default().postNotificationName(
+                showNotification, object: nil, userInfo: nil, deliverImmediately: true)
+            exit(0)
+        }
+        Log.write("starting \(Bundle.main.bundlePath)")
         let app = NSApplication.shared
         let delegate = AppDelegate()
         app.delegate = delegate
