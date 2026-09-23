@@ -9,6 +9,13 @@ Both languages of that card live in `cards.ts`; the `components/i18n.tsx` half
 this note used to point at was removed, because keeping two files in step by
 hand is what produced a version bumped on one side only.
 
+## v1.2.3 — 2026-09-22
+
+**New (Mac): the detailed view can be moved.** The popover under the menu-bar
+ring was pinned to the ring. Drag it away and it now tears off into a
+standalone window that can be placed anywhere, the standard macOS detachable
+popover. The detached window follows the Keep on top setting.
+
 ## v1.2.2 — 2026-09-22
 
 **Fixed (Mac): the floating card could not be moved.** It relied on

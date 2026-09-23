@@ -32,7 +32,7 @@ Requires macOS 13 or later.
 | Where | What |
 | --- | --- |
 | Menu bar | Ring plus the percentage. Green below 75%, amber at 75%, red at 90% or when the server marks it critical. Hover it for every limit at once. |
-| Click the ring | Popover: account, every limit with its full countdown and reset time, and buttons for Refresh, Show widget, and the gear menu |
+| Click the ring | Popover: account, every limit with its full countdown and reset time, and buttons for Refresh, Show widget, and the gear menu. Drag it away from the menu bar and it becomes its own window that you can move anywhere; it follows the Keep on top setting and closes with its close button. |
 | Gear menu | What the menu bar shows (5-hour / weekly / whichever is highest), language, keep widget on top, open at login, copy diagnostics, quit |
 | Floating widget | The Windows card: 224pt wide, one 18pt line per limit with the bar behind the text. Drag it by any part of the card to anywhere on any display; it remembers where you left it. **Keep on top** (on by default) keeps it above other apps; turn it off and it behaves like an ordinary window that other apps can cover and a click brings forward. Right-click it for refresh, keep on top, open at login, transparency, hide and quit. |
 
