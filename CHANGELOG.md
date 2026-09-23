@@ -9,6 +9,16 @@ Both languages of that card live in `cards.ts`; the `components/i18n.tsx` half
 this note used to point at was removed, because keeping two files in step by
 hand is what produced a version bumped on one side only.
 
+## v1.2.4 — 2026-09-22
+
+**Fixed (Mac): the torn-off detail view moved once, then never again.** v1.2.3
+used AppKit's default detached-popover window. It has no title bar, and the
+SwiftUI content claims every mouse-down, so only the tear-off drag itself moved
+it. The detail view now tears off into an ordinary titled window instead. You
+can also open it directly with the new **Open in window** button. It moves by
+its title bar like any other window, remembers its position, and follows Keep
+on top.
+
 ## v1.2.3 — 2026-09-22
 
 **New (Mac): the detailed view can be moved.** The popover under the menu-bar
