@@ -19,8 +19,8 @@ cd mac
 Look for a small ring and a percentage in the menu bar. There is no Dock icon.
 The first launch also opens the floating card, so you can see it working.
 Launching the app again while it is running opens the popover (or the card, if
-the menu bar is hiding the ring). Open the gear menu in the popover and turn on
-**Launch at login** so it starts with the Mac.
+the menu bar is hiding the ring). Turn on **Open at login** (gear menu, or
+right-click the floating card) so it starts with the Mac.
 
 Other build modes: `./build.sh` (build only), `./build.sh --test` (run the logic
 tests), `./build.sh --universal` (Apple silicon + Intel binary).
@@ -33,8 +33,8 @@ Requires macOS 13 or later.
 | --- | --- |
 | Menu bar | Ring plus the percentage. Green below 75%, amber at 75%, red at 90% or when the server marks it critical. Hover it for every limit at once. |
 | Click the ring | Popover: account, every limit with its full countdown and reset time, and buttons for Refresh, Show widget, and the gear menu |
-| Gear menu | What the menu bar shows (5-hour / weekly / whichever is highest), language, launch at login, copy diagnostics, quit |
-| Floating widget | The Windows card: 224pt wide, one 18pt line per limit with the bar behind the text. Stays on top across Spaces and full-screen apps. Drag it anywhere and it remembers where you left it. Right-click it for refresh, transparency, hide and quit. |
+| Gear menu | What the menu bar shows (5-hour / weekly / whichever is highest), language, keep widget on top, open at login, copy diagnostics, quit |
+| Floating widget | The Windows card: 224pt wide, one 18pt line per limit with the bar behind the text. Drag it by any part of the card to anywhere on any display; it remembers where you left it. **Keep on top** (on by default) keeps it above other apps; turn it off and it behaves like an ordinary window that other apps can cover and a click brings forward. Right-click it for refresh, keep on top, open at login, transparency, hide and quit. |
 
 ## Where the login comes from
 
@@ -101,6 +101,10 @@ response.
 - `--snapshot <dir>` renders the popover and widget to PNGs in both languages
   from live data, which is handy for checking layout without clicking anything.
 - Startup events go to `~/Library/Logs/ClaudeUsage.log` (never tokens).
+- **Open at login** registers with `SMAppService` (it appears under System
+  Settings > General > Login Items). If macOS refuses that for an ad-hoc-signed
+  build, the app writes `~/Library/LaunchAgents/com.kryptohead.claude-usage.plist`
+  instead. `--check-login-item` switches it on and off again and prints the result.
 - Settings live in the app's standard defaults (`com.kryptohead.claude-usage`).
   No token is ever written to disk outside the Keychain or Claude Code's own file.
 

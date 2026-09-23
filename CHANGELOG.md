@@ -9,6 +9,22 @@ Both languages of that card live in `cards.ts`; the `components/i18n.tsx` half
 this note used to point at was removed, because keeping two files in step by
 hand is what produced a version bumped on one side only.
 
+## v1.2.2 — 2026-09-22
+
+**Fixed (Mac): the floating card could not be moved.** It relied on
+`isMovableByWindowBackground`, but SwiftUI's hosting view swallows the
+mouse-down that depends on, so the card stayed where it first appeared. It is
+now moved by a drag gesture anywhere on the card, tracked from the global mouse
+position so it follows smoothly across displays, and the position is saved.
+
+**New (Mac): Keep on top** (widget right-click menu and gear menu, on by
+default). Off, the card is an ordinary window: other apps can cover it and a
+click brings it forward.
+
+**Open at login** is now in the widget's right-click menu too, and falls back to
+a LaunchAgent if `SMAppService` refuses an ad-hoc-signed build. Verified on the
+Mac Studio: registers with `SMAppService` and unregisters cleanly.
+
 ## v1.2.1 — 2026-09-22
 
 **Fixed (Mac): launching the app could look like nothing happened.** It is a
