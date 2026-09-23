@@ -1,0 +1,575 @@
+// App.swift - menu-bar item, popover, optional floating widget.
+
+import AppKit
+import SwiftUI
+import ServiceManagement
+
+// MARK: - settings
+
+enum MenuMetric: String, CaseIterable {
+    case session, week, highest
+    var title: String {
+        switch self {
+        case .session: return T("5-hour session", "5 小時工作階段")
+        case .week:    return T("Weekly (all models)", "每週（全部模型）")
+        case .highest: return T("Whichever is highest", "取最高者")
+        }
+    }
+}
+
+final class Settings {
+    static let d = UserDefaults.standard
+    static var lang: Lang {
+        get { Lang(rawValue: d.string(forKey: "lang") ?? "") ?? Lang.systemDefault }
+        set { d.set(newValue.rawValue, forKey: "lang") }
+    }
+    static var metric: MenuMetric {
+        get { MenuMetric(rawValue: d.string(forKey: "metric") ?? "") ?? .session }
+        set { d.set(newValue.rawValue, forKey: "metric") }
+    }
+    static var showWidget: Bool {
+        get { d.bool(forKey: "showWidget") }
+        set { d.set(newValue, forKey: "showWidget") }
+    }
+    static var widgetOrigin: NSPoint? {
+        get {
+            guard d.object(forKey: "widgetX") != nil else { return nil }
+            return NSPoint(x: d.double(forKey: "widgetX"), y: d.double(forKey: "widgetY"))
+        }
+        set {
+            if let p = newValue { d.set(p.x, forKey: "widgetX"); d.set(p.y, forKey: "widgetY") }
+            else { d.removeObject(forKey: "widgetX"); d.removeObject(forKey: "widgetY") }
+        }
+    }
+    static var widgetOpacity: Double {
+        get { d.object(forKey: "opacity") == nil ? 0.95 : d.double(forKey: "opacity") }
+        set { d.set(newValue, forKey: "opacity") }
+    }
+}
+
+// MARK: - model
+
+enum Status: Equatable {
+    case loading, live, ago(Int), stale, auth, throttled, offline, noToken
+    var text: String {
+        switch self {
+        case .loading:     return T("loading", "載入中")
+        case .live:        return T("live", "即時")
+        case .ago(let m):  return T("\(m)m ago", "\(m) 分鐘前")
+        case .stale:       return T("stale", "過時")
+        case .auth:        return T("auth", "需登入")
+        case .throttled:   return T("throttled", "限流中")
+        case .offline:     return T("offline", "離線")
+        case .noToken:     return T("no login", "未登入")
+        }
+    }
+    var color: Color {
+        switch self {
+        case .live: return Palette.green
+        case .stale, .throttled, .offline: return Palette.amber
+        case .auth, .noToken: return Palette.red
+        default: return Palette.dim
+        }
+    }
+}
+
+@MainActor
+final class UsageModel: ObservableObject {
+    @Published var data: JSON?
+    @Published var account: String?
+    @Published var status: Status = .loading
+    @Published var hint: String?
+    @Published var now = Date()
+    @Published var lang: Lang = Settings.lang
+
+    let store = MacCredentialStore()
+    lazy var client = UsageClient(store: store)
+
+    var refreshSeconds: Double = 180      // no faster: the endpoint rate-limits hard
+    private var backoff = 0
+    private var nextFetch = Date.distantPast
+    private var lastOk: Date?
+    private var fetching = false
+    private var timer: Timer?
+    var onChange: (@MainActor () -> Void)?
+
+    var rows: [UsageRow] { data.map(UsageParser.rows(from:)) ?? [] }
+
+    func start() {
+        Lang.current = lang
+        timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.tick() }
+        }
+        tick()
+    }
+
+    func setLang(_ l: Lang) {
+        lang = l; Lang.current = l; Settings.lang = l
+        updateStatusAge(); onChange?()
+    }
+
+    func refreshNow() { backoff = 0; nextFetch = .distantPast; tick() }
+
+    private func tick() {
+        now = Date()
+        if now >= nextFetch && !fetching { fetching = true; Task { await fetch() } }
+        updateStatusAge()
+        onChange?()
+    }
+
+    private func updateStatusAge() {
+        guard let ok = lastOk else { return }
+        switch status {
+        case .live, .ago, .stale:
+            let age = Int(now.timeIntervalSince(ok))
+            status = age < 90 ? .live : (age < 600 ? .ago(age / 60) : .stale)
+        default: break
+        }
+    }
+
+    func fetch() async {
+        fetching = true
+        defer {
+            fetching = false
+            nextFetch = Date().addingTimeInterval(refreshSeconds * pow(2, Double(backoff)))
+            onChange?()
+        }
+        do {
+            let u = try await client.usage()
+            data = u; lastOk = Date(); backoff = 0; hint = nil; status = .live
+            if account == nil, let p = try? await client.profile() {
+                account = UsageParser.email(fromProfile: p)   // cosmetic; never blocks usage
+            }
+        } catch let e as UsageError {
+            switch e {
+            case .noToken:
+                status = .noToken
+                hint = T("No Claude Code login found. Run `claude` in Terminal and /login.",
+                         "找不到 Claude Code 登入。請在終端機執行 `claude` 並 /login。")
+                backoff = 4
+                return
+            default: break
+            }
+            switch e.status {
+            case 401, 403:
+                account = nil; status = .auth
+                hint = T("Login expired - run /login in Claude Code.",
+                         "登入已過期，請在 Claude Code 執行 /login。")
+            case 429:
+                status = .throttled
+                hint = T("Rate limited - backing off.", "請求過於頻繁，稍後重試。")
+            default:
+                status = .offline
+                var msg = e.description
+                if let r = await client.lastRefreshError { msg += " / refresh: \(r)" }
+                hint = T("Fetch failed (\(msg))", "讀取失敗（\(msg)）")
+            }
+            backoff = min(5, backoff + 1)      // 180s -> up to ~96 min
+        } catch {
+            status = .offline
+            hint = "\(error)"
+            backoff = min(5, backoff + 1)
+        }
+    }
+
+    /// The number shown in the menu bar.
+    func menuValue() -> (percent: Double, severity: String)? {
+        let r = rows.filter { $0.literal == nil }
+        switch Settings.metric {
+        case .session: if let x = r.first(where: { $0.key == "session" }) { return (x.percent, x.severity) }
+        case .week:    if let x = r.first(where: { $0.key == "weekly_all" }) { return (x.percent, x.severity) }
+        case .highest: if let x = r.max(by: { $0.percent < $1.percent }) { return (x.percent, x.severity) }
+        }
+        return r.first.map { ($0.percent, $0.severity) }
+    }
+}
+
+// MARK: - look
+
+enum Palette {
+    static let card   = Color(red: 0.106, green: 0.106, blue: 0.122)
+    static let track  = Color.white.opacity(0.08)
+    static let text   = Color(red: 0.85, green: 0.85, blue: 0.88)
+    static let dim    = Color(red: 0.60, green: 0.60, blue: 0.65)
+    static let green  = Color(red: 0.29, green: 0.87, blue: 0.50)
+    static let amber  = Color(red: 0.98, green: 0.75, blue: 0.14)
+    static let red    = Color(red: 0.97, green: 0.44, blue: 0.44)
+    static func bar(_ rank: Int) -> Color { rank >= 2 ? red : (rank == 1 ? amber : green) }
+    static func nsBar(_ rank: Int) -> NSColor {
+        rank >= 2 ? NSColor(red: 0.97, green: 0.44, blue: 0.44, alpha: 1)
+            : rank == 1 ? NSColor(red: 0.98, green: 0.75, blue: 0.14, alpha: 1)
+            : NSColor(red: 0.29, green: 0.87, blue: 0.50, alpha: 1)
+    }
+}
+
+/// Label, percent and reset on ONE line with the bar painted behind them -
+/// the same compact row as the Windows widget.
+struct RowView: View {
+    let row: UsageRow
+    let now: Date
+    let compact: Bool
+
+    var body: some View {
+        let p = max(0, min(100, row.percent))
+        let rank = Fmt.rank(percent: p, severity: row.severity)
+        let reset = row.literal ?? Fmt.countdown(row.resetsAt, now: now, short: compact)
+        ZStack(alignment: .leading) {
+            RoundedRectangle(cornerRadius: 4).fill(Palette.track)
+            GeometryReader { g in
+                RoundedRectangle(cornerRadius: 4)
+                    .fill(Palette.bar(rank).opacity(0.35))
+                    .frame(width: max(2, g.size.width * p / 100))
+            }
+            HStack(spacing: 6) {
+                Text(compact ? row.short : row.label).foregroundColor(Palette.text)
+                Text(String(format: "%.0f%%", row.percent)).fontWeight(.semibold).foregroundColor(.white)
+                Spacer(minLength: 4)
+                Text(reset).font(.system(size: compact ? 10 : 11)).foregroundColor(Palette.dim)
+                    .lineLimit(1).truncationMode(.tail)
+            }
+            .font(.system(size: compact ? 11 : 12))
+            .padding(.horizontal, 7)
+        }
+        .frame(height: compact ? 18 : 22)
+        .help("\(row.label) - \(reset)")
+    }
+}
+
+struct UsageCard: View {
+    @ObservedObject var model: UsageModel
+    let compact: Bool
+    var onClose: (() -> Void)? = nil
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: compact ? 3 : 5) {
+            HStack(spacing: 6) {
+                Text(model.account ?? "Claude Usage")
+                    .font(.system(size: compact ? 10 : 11)).foregroundColor(Palette.dim)
+                    .lineLimit(1).truncationMode(.middle)
+                Spacer(minLength: 4)
+                Text(model.status.text).font(.system(size: compact ? 9 : 10)).foregroundColor(model.status.color)
+                if let close = onClose {
+                    Button(action: close) {
+                        Text("✕").font(.system(size: 10)).foregroundColor(Palette.dim)
+                    }
+                    .buttonStyle(.plain)
+                    .help(T("Hide widget", "隱藏小工具"))
+                }
+            }
+            .padding(.bottom, 2)
+
+            let rows = model.rows
+            if rows.isEmpty {
+                Text(model.data == nil ? T("Loading…", "載入中…") : T("No usage windows reported.", "沒有回報任何用量。"))
+                    .font(.system(size: 11)).foregroundColor(Palette.text)
+            }
+            ForEach(rows) { r in RowView(row: r, now: model.now, compact: compact) }
+
+            if let h = model.hint {
+                Text(h).font(.system(size: 9.5)).foregroundColor(Palette.dim)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(.horizontal, 10).padding(.top, 7).padding(.bottom, 8)
+        .frame(width: compact ? 224 : 372, alignment: .leading)
+    }
+}
+
+struct PopoverView: View {
+    @ObservedObject var model: UsageModel
+    let app: AppDelegate
+
+    var body: some View {
+        VStack(spacing: 0) {
+            UsageCard(model: model, compact: false)
+            Divider().overlay(Color.white.opacity(0.08))
+            HStack(spacing: 14) {
+                Button(T("Refresh", "更新")) { model.refreshNow() }
+                Button(app.widgetVisible ? T("Hide widget", "隱藏小工具") : T("Show widget", "顯示小工具")) {
+                    app.toggleWidget()
+                }
+                Spacer()
+                Menu {
+                    Picker(T("Menu bar shows", "選單列顯示"), selection: Binding(
+                        get: { Settings.metric }, set: { Settings.metric = $0; app.updateStatusItem() })) {
+                        ForEach(MenuMetric.allCases, id: \.self) { Text($0.title).tag($0) }
+                    }
+                    Picker(T("Language", "語言"), selection: Binding(
+                        get: { model.lang }, set: { model.setLang($0) })) {
+                        ForEach(Lang.allCases, id: \.self) { Text($0.displayName).tag($0) }
+                    }
+                    Toggle(T("Launch at login", "登入時啟動"), isOn: Binding(
+                        get: { app.launchAtLogin }, set: { app.setLaunchAtLogin($0) }))
+                    Divider()
+                    Button(T("Copy diagnostics", "複製診斷資訊")) { app.copyDiagnostics() }
+                    Button(T("Quit", "結束")) { NSApp.terminate(nil) }
+                } label: { Image(systemName: "gearshape") }
+                .menuStyle(.borderlessButton)
+                .menuIndicator(.hidden)
+                .fixedSize()
+            }
+            .buttonStyle(.plain)
+            .font(.system(size: 11))
+            .foregroundColor(Palette.text)
+            .padding(.horizontal, 12).padding(.vertical, 8)
+        }
+        .background(Palette.card)
+    }
+}
+
+struct WidgetView: View {
+    @ObservedObject var model: UsageModel
+    let app: AppDelegate
+    var body: some View {
+        UsageCard(model: model, compact: true, onClose: { app.toggleWidget() })
+            .background(RoundedRectangle(cornerRadius: 10).fill(Palette.card.opacity(0.95)))
+            .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.white.opacity(0.15), lineWidth: 1))
+            .contextMenu {
+                Button(T("Refresh now", "立即更新")) { model.refreshNow() }
+                Button(T("Toggle transparency", "切換透明度")) { app.toggleOpacity() }
+                Button(T("Hide widget", "隱藏小工具")) { app.toggleWidget() }
+                Divider()
+                Button(T("Quit", "結束")) { NSApp.terminate(nil) }
+            }
+    }
+}
+
+// MARK: - floating panel
+
+final class WidgetPanel: NSPanel {
+    override var canBecomeKey: Bool { true }
+}
+
+// MARK: - app delegate
+
+@MainActor
+final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
+    let model = UsageModel()
+    var statusItem: NSStatusItem!
+    let popover = NSPopover()
+    var panel: WidgetPanel?
+    var hosting: NSHostingView<WidgetView>?
+    var widgetVisible: Bool { panel?.isVisible ?? false }
+    private var popoverMonitor: Any?
+
+    func applicationDidFinishLaunching(_ note: Notification) {
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        if let b = statusItem.button {
+            b.target = self
+            b.action = #selector(togglePopover(_:))
+            b.imagePosition = .imageLeading
+        }
+
+        popover.behavior = .transient
+        popover.animates = false
+        popover.appearance = NSAppearance(named: .darkAqua)
+        popover.contentViewController = NSHostingController(rootView: PopoverView(model: model, app: self))
+
+        model.onChange = { [weak self] in self?.updateStatusItem(); self?.fitPanel() }
+        model.start()
+        if Settings.showWidget { showWidget() }
+        updateStatusItem()
+    }
+
+    // --- menu bar
+
+    func updateStatusItem() {
+        guard let b = statusItem?.button else { return }
+        let v = model.menuValue()
+        let rank = v.map { Fmt.rank(percent: $0.percent, severity: $0.severity) } ?? -1
+        b.image = Self.gauge(percent: v?.percent ?? 0, rank: rank)
+        let title = v.map { String(format: " %.0f%%", $0.percent) } ?? " –"
+        b.attributedTitle = NSAttributedString(string: title, attributes: [
+            .font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium),
+        ])
+        var tip = "Claude Usage"
+        for r in model.rows where r.literal == nil { tip += "\n\(r.label)  \(Int(r.percent.rounded()))%" }
+        b.toolTip = tip
+    }
+
+    /// A small ring gauge: grey track, arc in green / amber / red.
+    static func gauge(percent: Double, rank: Int) -> NSImage {
+        let size = NSSize(width: 15, height: 15)
+        let img = NSImage(size: size, flipped: false) { rect in
+            let c = NSPoint(x: rect.midX, y: rect.midY), r: CGFloat = 5.5
+            let track = NSBezierPath()
+            track.appendArc(withCenter: c, radius: r, startAngle: 0, endAngle: 360)
+            track.lineWidth = 2.4
+            NSColor.labelColor.withAlphaComponent(0.25).setStroke()
+            track.stroke()
+            if rank >= 0 {
+                let p = max(0.02, min(1, percent / 100))
+                let arc = NSBezierPath()
+                arc.appendArc(withCenter: c, radius: r, startAngle: 90, endAngle: 90 - 360 * p, clockwise: true)
+                arc.lineWidth = 2.4
+                arc.lineCapStyle = .round
+                Palette.nsBar(rank).setStroke()
+                arc.stroke()
+            }
+            return true
+        }
+        img.isTemplate = false
+        return img
+    }
+
+    @objc func togglePopover(_ sender: Any?) {
+        guard let b = statusItem.button else { return }
+        if popover.isShown { popover.performClose(sender); return }
+        popover.show(relativeTo: b.bounds, of: b, preferredEdge: .minY)
+        popover.contentViewController?.view.window?.makeKey()
+    }
+
+    // --- floating widget
+
+    func toggleWidget() {
+        if widgetVisible { panel?.orderOut(nil); Settings.showWidget = false }
+        else { showWidget() }
+        popover.performClose(nil)
+    }
+
+    func showWidget() {
+        if panel == nil {
+            let p = WidgetPanel(contentRect: NSRect(x: 0, y: 0, width: 224, height: 100),
+                                styleMask: [.borderless, .nonactivatingPanel],
+                                backing: .buffered, defer: false)
+            p.level = .floating
+            p.isFloatingPanel = true
+            p.hidesOnDeactivate = false
+            p.isMovableByWindowBackground = true
+            p.backgroundColor = .clear
+            p.isOpaque = false
+            p.hasShadow = true
+            p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
+            p.alphaValue = Settings.widgetOpacity
+            p.delegate = self
+            let h = NSHostingView(rootView: WidgetView(model: model, app: self))
+            p.contentView = h
+            hosting = h
+            panel = p
+            fitPanel()
+            if let o = Settings.widgetOrigin, NSScreen.screens.contains(where: { $0.visibleFrame.contains(o) }) {
+                p.setFrameOrigin(o)
+            } else if let s = NSScreen.main?.visibleFrame {
+                p.setFrameTopLeftPoint(NSPoint(x: s.maxX - 244, y: s.maxY - 20))
+            }
+        }
+        panel?.orderFrontRegardless()
+        Settings.showWidget = true
+    }
+
+    /// Resize to the SwiftUI content, keeping the top-left corner where it is.
+    func fitPanel() {
+        guard let p = panel, let h = hosting else { return }
+        let size = h.fittingSize
+        guard size.height > 0, abs(size.height - p.frame.height) > 0.5 || abs(size.width - p.frame.width) > 0.5 else { return }
+        let top = p.frame.maxY
+        p.setFrame(NSRect(x: p.frame.minX, y: top - size.height, width: size.width, height: size.height), display: true)
+    }
+
+    func toggleOpacity() {
+        let v = (panel?.alphaValue ?? 1) > 0.8 ? 0.62 : 0.95
+        panel?.alphaValue = v
+        Settings.widgetOpacity = v
+    }
+
+    func windowDidMove(_ note: Notification) {
+        if let p = panel { Settings.widgetOrigin = p.frame.origin }
+    }
+
+    // --- misc
+
+    var launchAtLogin: Bool { SMAppService.mainApp.status == .enabled }
+
+    func setLaunchAtLogin(_ on: Bool) {
+        do {
+            if on { try SMAppService.mainApp.register() } else { try SMAppService.mainApp.unregister() }
+        } catch {
+            let a = NSAlert()
+            a.messageText = T("Could not change Launch at Login", "無法變更登入時啟動")
+            a.informativeText = error.localizedDescription + "\n\n" +
+                T("Move the app into Applications and try again, or add it in System Settings > General > Login Items.",
+                  "請將 App 移到「應用程式」資料夾再試，或在 System Settings > General > Login Items 手動加入。")
+            a.runModal()
+        }
+    }
+
+    func copyDiagnostics() {
+        popover.performClose(nil)
+        let client = model.client, store = model.store
+        Task {
+            let text = await Diagnostics.report(client: client, store: store)
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(text, forType: .string)
+            let a = NSAlert()
+            a.messageText = T("Diagnostics copied to the clipboard", "診斷資訊已複製到剪貼簿")
+            a.informativeText = String(text.prefix(900))
+            a.runModal()
+        }
+    }
+}
+
+// MARK: - entry point
+
+@main
+@MainActor
+enum Main {
+    static func main() {
+        if CommandLine.arguments.contains("--diagnose") {
+            Lang.current = .en
+            let store = MacCredentialStore()
+            let client = UsageClient(store: store)
+            let sem = DispatchSemaphore(value: 0)
+            Task.detached {
+                print(await Diagnostics.report(client: client, store: store))
+                sem.signal()
+            }
+            sem.wait()
+            exit(0)
+        }
+        if let i = CommandLine.arguments.firstIndex(of: "--snapshot"), i + 1 < CommandLine.arguments.count {
+            snapshot(to: CommandLine.arguments[i + 1]); exit(0)
+        }
+        let app = NSApplication.shared
+        let delegate = AppDelegate()
+        app.delegate = delegate
+        app.setActivationPolicy(.accessory)     // menu-bar only: no Dock icon
+        withExtendedLifetime(delegate) { app.run() }
+    }
+
+    /// --snapshot <dir>: fetch once and render the popover and widget to PNGs
+    /// (both languages). Used to check the layout without clicking the menu bar.
+    static func snapshot(to dir: String) {
+        _ = NSApplication.shared
+        let model = UsageModel()
+        let done = DispatchSemaphore(value: 0)
+        final class Box: @unchecked Sendable { var payload: JSON?; var email: String? }
+        let box = Box()
+        let client = model.client
+        Task.detached {
+            box.payload = try? await client.usage()
+            box.email = (try? await client.profile()).flatMap { UsageParser.email(fromProfile: $0) }
+            done.signal()
+        }
+        done.wait()
+        model.data = box.payload; model.account = box.email; model.status = box.payload == nil ? .offline : .live
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        let delegate = AppDelegate()
+        for lang in Lang.allCases {
+            Lang.current = lang; model.lang = lang
+            let views: [(String, AnyView)] = [
+                ("popover", AnyView(PopoverView(model: model, app: delegate).environment(\.colorScheme, .dark))),
+                ("widget", AnyView(WidgetView(model: model, app: delegate).padding(8))),
+            ]
+            for (name, v) in views {
+                let r = ImageRenderer(content: v)
+                r.scale = 2
+                if let cg = r.cgImage {
+                    let rep = NSBitmapImageRep(cgImage: cg)
+                    try? rep.representation(using: .png, properties: [:])?
+                        .write(to: URL(fileURLWithPath: "\(dir)/\(name)-\(lang.rawValue).png"))
+                }
+            }
+        }
+        print("snapshots written to \(dir)")
+    }
+}
