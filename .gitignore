@@ -4,3 +4,6 @@ widget-state.json
 # Build artifact
 claude-usage-widget.zip
 *.zip
+
+# macOS build output
+mac/build/
