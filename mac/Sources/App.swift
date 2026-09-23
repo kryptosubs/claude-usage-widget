@@ -287,6 +287,7 @@ struct UsageCard: View {
 struct PopoverView: View {
     @ObservedObject var model: UsageModel
     let app: AppDelegate
+    var inWindow = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -296,6 +297,9 @@ struct PopoverView: View {
                 Button(T("Refresh", "更新")) { model.refreshNow() }
                 Button(app.widgetVisible ? T("Hide widget", "隱藏小工具") : T("Show widget", "顯示小工具")) {
                     app.toggleWidget()
+                }
+                if !inWindow {
+                    Button(T("Open in window", "開成視窗")) { app.openDetailWindow() }
                 }
                 Spacer()
                 Menu {
@@ -307,7 +311,7 @@ struct PopoverView: View {
                         get: { model.lang }, set: { model.setLang($0) })) {
                         ForEach(Lang.allCases, id: \.self) { Text($0.displayName).tag($0) }
                     }
-                    Toggle(T("Keep widget on top", "小工具保持在最上層"), isOn: Binding(
+                    Toggle(T("Keep on top", "保持在最上層"), isOn: Binding(
                         get: { Settings.widgetOnTop }, set: { app.setWidgetOnTop($0) }))
                     Toggle(T("Open at login", "開機登入時啟動"), isOn: Binding(
                         get: { app.launchAtLogin }, set: { app.setLaunchAtLogin($0) }))
@@ -493,15 +497,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
         popover.contentViewController?.view.window?.makeKey()
     }
 
-    /// Dragging the popover tears it off into its own window, which can then be
-    /// moved anywhere like any other window (the standard macOS behaviour).
+    // --- detail window
+    //
+    // v1.2.3 let the popover detach into AppKit's default detached window. That
+    // window has no title bar, and the SwiftUI content claims every mouse-down,
+    // so after the tear-off drag it could never be moved again. The detail view
+    // now tears off into (or opens as) an ordinary titled window instead, which
+    // moves by its title bar like any other app's window and remembers its frame.
+
+    private var detailWindow: NSWindow?
+
     func popoverShouldDetach(_ popover: NSPopover) -> Bool { true }
 
-    func popoverDidDetach(_ popover: NSPopover) {
-        guard let w = popover.contentViewController?.view.window else { return }
+    func detachableWindow(for popover: NSPopover) -> NSWindow? {
+        Log.write("popover torn off into the detail window")
+        return makeDetailWindow()
+    }
+
+    func openDetailWindow() {
+        popover.performClose(nil)
+        let w = makeDetailWindow()
+        NSApp.activate(ignoringOtherApps: true)
+        w.makeKeyAndOrderFront(nil)
+        Log.write("detail window opened")
+    }
+
+    private func makeDetailWindow() -> NSWindow {
+        if let w = detailWindow { return w }
+        let host = NSHostingController(rootView: PopoverView(model: model, app: self, inWindow: true))
+        let w = NSWindow(contentViewController: host)
+        w.styleMask = [.titled, .closable, .miniaturizable]
+        w.title = "Claude Usage"
+        w.appearance = NSAppearance(named: .darkAqua)
+        w.isReleasedWhenClosed = false
         w.level = Settings.widgetOnTop ? .floating : .normal
         w.collectionBehavior.insert(.canJoinAllSpaces)
-        Log.write("popover detached into a window")
+        if !w.setFrameUsingName("ClaudeUsageDetail") { w.center() }
+        w.setFrameAutosaveName("ClaudeUsageDetail")
+        detailWindow = w
+        return w
     }
 
     // --- floating widget
@@ -572,9 +606,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
         panel?.level = on ? .floating : .normal
         panel?.isFloatingPanel = on
         panel?.orderFrontRegardless()
-        if popover.isDetached, let w = popover.contentViewController?.view.window {
-            w.level = on ? .floating : .normal
-        }
+        detailWindow?.level = on ? .floating : .normal
         Log.write("widget on top: \(on)")
     }
 
