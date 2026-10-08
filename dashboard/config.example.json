@@ -1,0 +1,52 @@
+{
+  "port": 8787,
+  "bind": "0.0.0.0",
+  "plans": [
+    {
+      "id": "claude",
+      "name": "Claude Pro",
+      "monthly": 20,
+      "meter": "live",
+      "en": "Chat, Cowork, Claude Code, browser agents and scheduled tasks share one allowance",
+      "zh": "聊天、Cowork、Claude Code、瀏覽器代理、排程任務共用一個額度"
+    },
+    {
+      "id": "gemini",
+      "name": "Google AI Pro",
+      "monthly": 19.99,
+      "meter": "none",
+      "en": "Shared with I-Wen and Isaac. No usage API",
+      "zh": "已分享給 I-Wen 和 Isaac，沒有用量 API"
+    },
+    {
+      "id": "grok",
+      "name": "X Premium (Grok)",
+      "monthly": 8,
+      "meter": "none",
+      "en": "Rate-limited Grok. No usage API",
+      "zh": "有額度限制的 Grok，沒有用量 API"
+    },
+    {
+      "id": "muse",
+      "name": "Meta Muse",
+      "monthly": 0,
+      "meter": "none",
+      "en": "Free tier, 100M tokens a week. No usage API",
+      "zh": "免費版，每週 1 億 token，沒有用量 API"
+    },
+    {
+      "id": "ollama",
+      "name": "Ollama (Mac Studio)",
+      "monthly": 0,
+      "meter": "live",
+      "en": "Local, no quota",
+      "zh": "本機，沒有額度"
+    }
+  ],
+  "ollama": {
+    "url": "http://127.0.0.1:11434",
+    "primary": "qwen3.8:27b-mlx",
+    "backup": "nemotron-3.5-lightning"
+  },
+  "refresh_seconds": 60
+}

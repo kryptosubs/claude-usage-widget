@@ -9,6 +9,27 @@ Both languages of that card live in `cards.ts`; the `components/i18n.tsx` half
 this note used to point at was removed, because keeping two files in step by
 hand is what produced a version bumped on one side only.
 
+## v1.3 — 2026-10-08
+
+**New (Mac): a snapshot other local tools can read.** After every fetch the app
+writes `~/Library/Application Support/ClaudeUsage/latest.json`: the status
+(`live`, `stale`, `auth`, `throttled`, `offline`, `no_login`), the time of the
+last good fetch, the account, and the raw usage response. On a failed fetch the
+last good numbers stay in the file and the status says how stale they are. Each
+successful fetch also appends one line to `history.jsonl` (limit key, percent,
+reset time; 35 days kept), which is what lets a reader work out burn rate and
+when a weekly cap will run out.
+
+This exists for the ai-usage dashboard, new in `dashboard/` (see its README). The widget stays
+the only process that reads or refreshes the Claude Code login: a second reader
+refreshing on its own would spend the same rotating refresh token and log one
+of them out. No token goes into either file, both are owner-only (0600) in an
+owner-only folder, and the history stores limit keys rather than labels, so it
+does not change with the UI language.
+
+`./build.sh --test` now also builds and runs `Tests/SnapshotTests.swift`
+(18 checks: contents, permissions, last good numbers kept on failure, pruning, append).
+
 ## v1.2.4 — 2026-09-22
 
 **Fixed (Mac): the torn-off detail view moved once, then never again.** v1.2.3
