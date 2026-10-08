@@ -16,13 +16,16 @@ if ! command -v swiftc >/dev/null 2>&1; then
     exit 1
 fi
 
-CORE=(Sources/UsageCore.swift Sources/Credentials.swift Sources/UsageClient.swift)
+CORE=(Sources/UsageCore.swift Sources/Credentials.swift Sources/UsageClient.swift Sources/Snapshot.swift)
 MIN_OS=13.0
 
 if [[ "${1:-}" == "--test" ]]; then
     mkdir -p build
     swiftc -O -target "$(uname -m)-apple-macos$MIN_OS" "${CORE[@]}" Tests/main.swift -o build/tests
+    swiftc -O -parse-as-library -target "$(uname -m)-apple-macos$MIN_OS" "${CORE[@]}" \
+        Tests/SnapshotTests.swift -o build/snapshot-tests
     ./build/tests
+    ./build/snapshot-tests
     exit $?
 fi
 
