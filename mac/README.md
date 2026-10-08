@@ -90,6 +90,21 @@ response.
 | `throttled` | Rate limited (429). Backing off; the last good numbers stay on screen. |
 | `offline` | Network or endpoint error. Copy diagnostics. |
 
+## Snapshot for other tools (v1.3)
+
+After every fetch the app writes two files that other programs on this Mac can
+read without ever touching the login:
+
+| File | What |
+| --- | --- |
+| `~/Library/Application Support/ClaudeUsage/latest.json` | `status` (`live`, `stale`, `auth`, `throttled`, `offline`, `no_login`), `fetched_at` (last good fetch), `account`, and `payload`, the raw usage response. A failed fetch keeps the last good payload. |
+| `~/Library/Application Support/ClaudeUsage/history.jsonl` | One line per successful fetch: `{"t": time, "rows": [{"k": "weekly_all", "p": 71, "r": reset}]}`. Keys, not labels. 35 days kept. |
+
+Both are owner-only and hold no token. The ai-usage dashboard
+(`../dashboard`) reads them to chart the week and project when a cap will
+run out. Keep the widget as the only thing that refreshes the login: a second
+refresher would spend the same rotating refresh token.
+
 ## Notes
 
 - Polls every 180 s and doubles the interval on each failure, capping at about
@@ -115,7 +130,9 @@ response.
 | `Sources/UsageCore.swift` | Payload → rows, countdowns, money, EN/繁中 strings. Foundation only. |
 | `Sources/Credentials.swift` | Keychain/file discovery, ranking, write-back |
 | `Sources/UsageClient.swift` | Token refresh (single-flight), API calls, diagnostics |
+| `Sources/Snapshot.swift` | `latest.json` and `history.jsonl` for other local tools |
 | `Sources/App.swift` | Menu bar, popover, floating panel, login item |
 | `Tests/main.swift` | 52 checks, including a rotating-token stub server |
+| `Tests/SnapshotTests.swift` | 18 checks for the snapshot files |
 | `Tools/MakeIcon.swift` | Draws the app icon at build time |
 | `build.sh`, `Info.plist` | Build without Xcode |
