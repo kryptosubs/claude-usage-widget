@@ -72,6 +72,18 @@ enum Status: Equatable {
         case .noToken:     return T("no login", "未登入")
         }
     }
+    /// Language-independent name for the snapshot file other tools read.
+    var code: String {
+        switch self {
+        case .loading:   return "loading"
+        case .live, .ago: return "live"
+        case .stale:     return "stale"
+        case .auth:      return "auth"
+        case .throttled: return "throttled"
+        case .offline:   return "offline"
+        case .noToken:   return "no_login"
+        }
+    }
     var color: Color {
         switch self {
         case .live: return Palette.green
@@ -141,11 +153,13 @@ final class UsageModel: ObservableObject {
         defer {
             fetching = false
             nextFetch = Date().addingTimeInterval(refreshSeconds * pow(2, Double(backoff)))
+            Snapshot.writeLatest(payload: data, account: account, status: status.code, lastOk: lastOk)
             onChange?()
         }
         do {
             let u = try await client.usage()
             data = u; lastOk = Date(); backoff = 0; hint = nil; status = .live
+            Snapshot.appendHistory(rows: UsageParser.rows(from: u))
             if account == nil, let p = try? await client.profile() {
                 account = UsageParser.email(fromProfile: p)   // cosmetic; never blocks usage
             }
