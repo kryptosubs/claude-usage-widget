@@ -9,6 +9,20 @@ Both languages of that card live in `cards.ts`; the `components/i18n.tsx` half
 this note used to point at was removed, because keeping two files in step by
 hand is what produced a version bumped on one side only.
 
+## v1.3.1 — 2026-10-12
+
+**Fixed (Mac): two copies of the detail view, and the popover opening far below
+the ring, came back in v1.3.** v1.3 was built from the v1.2.4 source on GitHub,
+and v1.2.5 had been installed on the Mac but never pushed. That rebuild
+reinstated the NSPopover and its tear-off window. This release puts the v1.2.5
+fix on top of v1.3. The NSPopover and the separate detail window are gone, and
+the **Open in window** button with them. One borderless panel opens just under
+the menu bar, centred on where you clicked the ring. It closes on an outside
+click, Esc, ✕ or a second click on the ring. Drag it to pin it: it then stays
+open and follows Keep on top until you close it. The next time it opens, it
+anchors under the ring again. The v1.3 snapshot (`latest.json` /
+`history.jsonl`) is unchanged.
+
 ## v1.3 — 2026-10-08
 
 **New (Mac): a snapshot other local tools can read.** After every fetch the app

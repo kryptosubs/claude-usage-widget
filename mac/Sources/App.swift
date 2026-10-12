@@ -1,4 +1,4 @@
-// App.swift - menu-bar item, popover, optional floating widget.
+// App.swift - menu-bar item, detail panel, optional floating widget.
 
 import AppKit
 import SwiftUI
@@ -262,6 +262,7 @@ struct UsageCard: View {
     @ObservedObject var model: UsageModel
     let compact: Bool
     var onClose: (() -> Void)? = nil
+    var closeHelp: String? = nil
 
     var body: some View {
         VStack(alignment: .leading, spacing: compact ? 3 : 5) {
@@ -276,7 +277,7 @@ struct UsageCard: View {
                         Text("✕").font(.system(size: 10)).foregroundColor(Palette.dim)
                     }
                     .buttonStyle(.plain)
-                    .help(T("Hide widget", "隱藏小工具"))
+                    .help(closeHelp ?? T("Hide widget", "隱藏小工具"))
                 }
             }
             .padding(.bottom, 2)
@@ -301,19 +302,16 @@ struct UsageCard: View {
 struct PopoverView: View {
     @ObservedObject var model: UsageModel
     let app: AppDelegate
-    var inWindow = false
+    var onClose: (() -> Void)? = nil
 
     var body: some View {
         VStack(spacing: 0) {
-            UsageCard(model: model, compact: false)
+            UsageCard(model: model, compact: false, onClose: onClose, closeHelp: T("Close", "關閉"))
             Divider().overlay(Color.white.opacity(0.08))
             HStack(spacing: 14) {
                 Button(T("Refresh", "更新")) { model.refreshNow() }
                 Button(app.widgetVisible ? T("Hide widget", "隱藏小工具") : T("Show widget", "顯示小工具")) {
                     app.toggleWidget()
-                }
-                if !inWindow {
-                    Button(T("Open in window", "開成視窗")) { app.openDetailWindow() }
                 }
                 Spacer()
                 Menu {
@@ -343,6 +341,22 @@ struct PopoverView: View {
             .padding(.horizontal, 12).padding(.vertical, 8)
         }
         .background(Palette.card)
+    }
+}
+
+/// The detail view as it appears in its own panel under the menu-bar ring.
+/// Drag anywhere on it to move it; moving it pins it open.
+struct DetailView: View {
+    @ObservedObject var model: UsageModel
+    let app: AppDelegate
+    var body: some View {
+        PopoverView(model: model, app: app, onClose: { app.closeDetail() })
+            .clipShape(RoundedRectangle(cornerRadius: 12))
+            .overlay(RoundedRectangle(cornerRadius: 12).stroke(Color.white.opacity(0.15), lineWidth: 1))
+            .contentShape(RoundedRectangle(cornerRadius: 12))
+            .gesture(DragGesture(minimumDistance: 3)
+                .onChanged { _ in app.dragDetail() }
+                .onEnded { _ in app.endDetailDrag() })
     }
 }
 
@@ -387,17 +401,22 @@ final class WidgetPanel: NSPanel {
     }
 }
 
+/// Borderless panel for the detail view. Esc closes it.
+final class DetailPanel: NSPanel {
+    var onCancel: (@MainActor () -> Void)?
+    override var canBecomeKey: Bool { true }
+    override func cancelOperation(_ sender: Any?) { onCancel?() }
+}
+
 // MARK: - app delegate
 
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPopoverDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     let model = UsageModel()
     var statusItem: NSStatusItem!
-    let popover = NSPopover()
     var panel: WidgetPanel?
     var hosting: NSHostingView<WidgetView>?
     var widgetVisible: Bool { panel?.isVisible ?? false }
-    private var popoverMonitor: Any?
 
     func applicationDidFinishLaunching(_ note: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -407,13 +426,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
             b.imagePosition = .imageLeading
         }
 
-        popover.behavior = .transient
-        popover.animates = false
-        popover.delegate = self
-        popover.appearance = NSAppearance(named: .darkAqua)
-        popover.contentViewController = NSHostingController(rootView: PopoverView(model: model, app: self))
-
-        model.onChange = { [weak self] in self?.updateStatusItem(); self?.fitPanel() }
+        model.onChange = { [weak self] in self?.updateStatusItem(); self?.fitPanel(); self?.fitDetail() }
         model.start()
         updateStatusItem()
 
@@ -450,14 +463,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
         return NSScreen.screens.contains { $0.frame.intersects(w.frame) }
     }
 
-    /// Show something: the popover under the menu-bar item if it is visible,
-    /// otherwise the floating card.
+    /// Show something: the detail panel under the menu-bar item if it is
+    /// visible, otherwise the floating card.
     func reveal() {
         Log.write("reveal; status item on screen: \(statusItemOnScreen)")
-        if statusItemOnScreen, let b = statusItem.button {
-            NSApp.activate(ignoringOtherApps: true)
-            if !popover.isShown { popover.show(relativeTo: b.bounds, of: b, preferredEdge: .minY) }
-            popover.contentViewController?.view.window?.makeKey()
+        if detailVisible {
+            bringDetailFront()
+        } else if statusItemOnScreen {
+            showDetail(anchor: statusAnchor())
         } else {
             showWidget()
         }
@@ -505,59 +518,130 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
     }
 
     @objc func togglePopover(_ sender: Any?) {
-        guard let b = statusItem.button else { return }
-        if popover.isShown { popover.performClose(sender); return }
-        popover.show(relativeTo: b.bounds, of: b, preferredEdge: .minY)
-        popover.contentViewController?.view.window?.makeKey()
+        // Anchor on the click itself: it is by definition on the ring.
+        let click = NSEvent.mouseLocation
+        if let p = detailPanel, p.isVisible {
+            if detailPinned && !p.isKeyWindow { bringDetailFront() } else { closeDetail() }
+            return
+        }
+        showDetail(anchor: click)
     }
 
-    // --- detail window
+    // --- detail panel
     //
-    // v1.2.3 let the popover detach into AppKit's default detached window. That
-    // window has no title bar, and the SwiftUI content claims every mouse-down,
-    // so after the tear-off drag it could never be moved again. The detail view
-    // now tears off into (or opens as) an ordinary titled window instead, which
-    // moves by its title bar like any other app's window and remembers its frame.
+    // v1.2.3/1.2.4 used an NSPopover that could tear off into a window. On macOS 27
+    // the popover opened well below the ring, and tearing it off left a window that
+    // the next click on the ring duplicated. It is now one borderless panel that we
+    // place ourselves: directly under the ring, closed by an outside click, Esc, the
+    // close button or another click on the ring. Dragging it anywhere pins it: it
+    // then stays open where it was put (following Keep on top) until closed.
 
-    private var detailWindow: NSWindow?
+    var detailPanel: DetailPanel?
+    var detailHost: NSHostingView<DetailView>?
+    var detailPinned = false
+    var detailVisible: Bool { detailPanel?.isVisible ?? false }
+    private var outsideClickMonitor: Any?
+    private var detailDragAnchor: (mouse: NSPoint, origin: NSPoint)?
 
-    func popoverShouldDetach(_ popover: NSPopover) -> Bool { true }
-
-    func detachableWindow(for popover: NSPopover) -> NSWindow? {
-        Log.write("popover torn off into the detail window")
-        return makeDetailWindow()
+    /// Centre of the ring in screen coordinates, from the status item's own window.
+    func statusAnchor() -> NSPoint? {
+        guard let b = statusItem.button, let w = b.window else { return nil }
+        let r = w.convertToScreen(b.convert(b.bounds, to: nil))
+        return NSPoint(x: r.midX, y: r.midY)
     }
 
-    func openDetailWindow() {
-        popover.performClose(nil)
-        let w = makeDetailWindow()
+    func showDetail(anchor: NSPoint?) {
+        let p = detailPanel ?? makeDetailPanel()
+        fitDetail(force: true)
+        let a = anchor ?? statusAnchor() ?? NSEvent.mouseLocation
+        if let s = NSScreen.screens.first(where: { $0.frame.contains(a) }) ?? NSScreen.main {
+            let vf = s.visibleFrame, size = p.frame.size
+            let menuBottom = min(vf.maxY, s.frame.maxY - NSStatusBar.system.thickness)
+            let top = menuBottom - 4
+            let x = max(vf.minX + 6, min(a.x - size.width / 2, vf.maxX - size.width - 6))
+            p.setFrameTopLeftPoint(NSPoint(x: x, y: top))
+            Log.write("detail shown under \(NSStringFromPoint(a)); ring \(statusAnchor().map { NSStringFromPoint($0) } ?? "-"); frame \(NSStringFromRect(p.frame))")
+        }
+        detailPinned = false
+        p.level = .popUpMenu
         NSApp.activate(ignoringOtherApps: true)
-        w.makeKeyAndOrderFront(nil)
-        Log.write("detail window opened")
+        p.makeKeyAndOrderFront(nil)
+        if outsideClickMonitor == nil {
+            outsideClickMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
+                Task { @MainActor in
+                    guard let self, !self.detailPinned else { return }
+                    self.closeDetail()
+                }
+            }
+        }
     }
 
-    private func makeDetailWindow() -> NSWindow {
-        if let w = detailWindow { return w }
-        let host = NSHostingController(rootView: PopoverView(model: model, app: self, inWindow: true))
-        let w = NSWindow(contentViewController: host)
-        w.styleMask = [.titled, .closable, .miniaturizable]
-        w.title = "Claude Usage"
-        w.appearance = NSAppearance(named: .darkAqua)
-        w.isReleasedWhenClosed = false
-        w.level = Settings.widgetOnTop ? .floating : .normal
-        w.collectionBehavior.insert(.canJoinAllSpaces)
-        if !w.setFrameUsingName("ClaudeUsageDetail") { w.center() }
-        w.setFrameAutosaveName("ClaudeUsageDetail")
-        detailWindow = w
-        return w
+    func closeDetail() {
+        detailPanel?.orderOut(nil)
+        detailPinned = false
+        detailDragAnchor = nil
+        if let m = outsideClickMonitor { NSEvent.removeMonitor(m); outsideClickMonitor = nil }
     }
+
+    func bringDetailFront() {
+        guard let p = detailPanel else { return }
+        NSApp.activate(ignoringOtherApps: true)
+        p.makeKeyAndOrderFront(nil)
+    }
+
+    private func makeDetailPanel() -> DetailPanel {
+        let p = DetailPanel(contentRect: NSRect(x: 0, y: 0, width: 372, height: 160),
+                            styleMask: [.borderless, .nonactivatingPanel],
+                            backing: .buffered, defer: false)
+        p.isFloatingPanel = true
+        p.hidesOnDeactivate = false
+        p.isMovableByWindowBackground = false      // moved by dragDetail() instead
+        p.backgroundColor = .clear
+        p.isOpaque = false
+        p.hasShadow = true
+        p.isReleasedWhenClosed = false
+        p.appearance = NSAppearance(named: .darkAqua)
+        p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        p.onCancel = { [weak self] in self?.closeDetail() }
+        let h = NSHostingView(rootView: DetailView(model: model, app: self))
+        p.contentView = h
+        detailHost = h
+        detailPanel = p
+        return p
+    }
+
+    /// Resize to the SwiftUI content, keeping the top-left corner where it is.
+    func fitDetail(force: Bool = false) {
+        guard let p = detailPanel, let h = detailHost, force || p.isVisible else { return }
+        let size = h.fittingSize
+        guard size.height > 0, abs(size.height - p.frame.height) > 0.5 || abs(size.width - p.frame.width) > 0.5 else { return }
+        let top = p.frame.maxY
+        p.setFrame(NSRect(x: p.frame.minX, y: top - size.height, width: size.width, height: size.height), display: true)
+    }
+
+    func dragDetail() {
+        guard let p = detailPanel else { return }
+        let m = NSEvent.mouseLocation
+        if detailDragAnchor == nil {
+            detailDragAnchor = (m, p.frame.origin)
+            if !detailPinned {
+                detailPinned = true
+                p.level = Settings.widgetOnTop ? .floating : .normal
+                Log.write("detail panel pinned by a drag")
+            }
+        }
+        guard let a = detailDragAnchor else { return }
+        p.setFrameOrigin(NSPoint(x: a.origin.x + m.x - a.mouse.x, y: a.origin.y + m.y - a.mouse.y))
+    }
+
+    func endDetailDrag() { detailDragAnchor = nil }
 
     // --- floating widget
 
     func toggleWidget() {
         if widgetVisible { panel?.orderOut(nil); Settings.showWidget = false }
         else { showWidget() }
-        popover.performClose(nil)
+        if !detailPinned { closeDetail() }
     }
 
     func showWidget() {
@@ -620,7 +704,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
         panel?.level = on ? .floating : .normal
         panel?.isFloatingPanel = on
         panel?.orderFrontRegardless()
-        detailWindow?.level = on ? .floating : .normal
+        if detailPinned { detailPanel?.level = on ? .floating : .normal }
         Log.write("widget on top: \(on)")
     }
 
@@ -690,7 +774,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
     }
 
     func copyDiagnostics() {
-        popover.performClose(nil)
+        if !detailPinned { closeDetail() }
         let client = model.client, store = model.store
         Task {
             let text = await Diagnostics.report(client: client, store: store)
