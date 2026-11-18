@@ -20,7 +20,7 @@ enum UsageError: Error, CustomStringConvertible {
     }
     var description: String {
         switch self {
-        case .noToken:                  return "no Claude Code login found"
+        case .noToken:                  return "not signed in (no widget sign-in or Claude Code login found)"
         case .http(let c, let s, let b): return "\(c): HTTP \(s)" + (b.isEmpty ? "" : " \(b.prefix(160))")
         case .refreshRejected(let s):   return "refresh rejected (\(s))"
         case .network(let m):           return m
@@ -75,6 +75,14 @@ actor UsageClient {
     }
 
     private var nowMs: Double { now().timeIntervalSince1970 * 1000 }
+
+    /// After a sign-in or sign-out: forget the cached token without marking it rejected.
+    func reset() {
+        cachedToken = nil
+        cachedExpiresMs = 0
+        rejectedToken = nil
+        (store as? MacCredentialStore)?.rescan()
+    }
 
     /// Call after a 401/403: forget the token and look again next time.
     func invalidate() {
@@ -188,6 +196,35 @@ actor UsageClient {
         throw last
     }
 
+    /// Authorization-code exchange for the browser sign-in (same token endpoints as refresh).
+    func exchangeCode(_ code: String, verifier: String, redirectURI: String, state: String) async throws -> JSON {
+        let body = try JSONSerialization.data(withJSONObject: [
+            "grant_type": "authorization_code", "code": code, "redirect_uri": redirectURI,
+            "client_id": Self.clientId, "code_verifier": verifier, "state": state,
+        ])
+        var last: Error = UsageError.network("no token endpoint reachable")
+        for url in Self.tokenURLs {
+            var req = URLRequest(url: url, timeoutInterval: 20)
+            req.httpMethod = "POST"
+            req.httpBody = body
+            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            req.setValue(Self.userAgent, forHTTPHeaderField: "User-Agent")
+            do {
+                let (code, data) = try await http.send(req)
+                if code == 200, let j = try? JSONSerialization.jsonObject(with: data) as? JSON,
+                   j.str("access_token") != nil { return j }
+                let err = UsageError.http(call: "token exchange", status: code, body: String(data: data, encoding: .utf8) ?? "")
+                // the endpoint is alive and said no; a code works once, so don't replay it elsewhere
+                if (400..<500).contains(code) && code != 404 { throw err }
+                last = err
+            } catch let e as UsageError {
+                if case .http(_, let st, _) = e, (400..<500).contains(st), st != 404 { throw e }
+                last = e
+            }
+        }
+        throw last
+    }
+
     private func get(_ url: URL, call: String) async throws -> JSON {
         let token = try await accessToken()
         var req = URLRequest(url: url, timeoutInterval: 15)
@@ -237,7 +274,7 @@ enum Diagnostics {
         let sources = store.loadAll()
         out.append("Claude Code logins found:")
         if sources.isEmpty {
-            out.append("  (none) - run `claude` in Terminal and /login")
+            out.append("  (none) - use Sign in in the app, or run `claude` in Terminal and /login")
         }
         for c in sources {
             var when = "no expiry recorded"
@@ -278,7 +315,7 @@ enum Diagnostics {
             if let e = await client.lastRefreshError { out.append("  refresh error: \(e)") }
             let st = (error as? UsageError)?.status ?? 0
             if st == 401 || st == 403 {
-                out.append("  -> no usable login. Run `claude` in Terminal, then /login.")
+                out.append("  -> no usable login. Use Sign in in the app (or /login in Claude Code).")
                 out.append("     `claude setup-token` tokens do NOT work here (the usage endpoint 403s them).")
             }
             if st == 429 { out.append("  -> rate limited; wait a few minutes.") }

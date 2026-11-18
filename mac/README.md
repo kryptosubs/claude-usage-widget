@@ -5,8 +5,9 @@ usage, a popover with every limit, and an optional floating card that matches th
 Windows widget row for row. English and Traditional Chinese.
 
 It's a native Swift app, and building it needs nothing beyond the Xcode Command
-Line Tools. There's no Xcode project, no dependencies, and no second sign-in: it
-reads the login Claude Code already has.
+Line Tools. There's no Xcode project and no dependencies. It reads the login
+Claude Code already has, or you can sign it in on its own with **Sign in with
+Google** (see below).
 
 ## Install
 
@@ -33,13 +34,32 @@ Requires macOS 13 or later.
 | --- | --- |
 | Menu bar | Ring plus the percentage. Green below 75%, amber at 75%, red at 90% or when the server marks it critical. Hover it for every limit at once. |
 | Click the ring | Detail panel just under the menu bar, centred where you clicked: account, every limit with its full countdown and reset time, and buttons for Refresh, Show widget, and the gear menu. It closes on an outside click, Esc, ✕ or another click on the ring. Drag it anywhere to pin it: it then stays open and follows the Keep on top setting until you close it. |
-| Gear menu | What the menu bar shows (5-hour / weekly / whichever is highest), language, keep on top (applies to the card and the window), open at login, copy diagnostics, quit |
+| Gear menu | What the menu bar shows (5-hour / weekly / whichever is highest), language, keep on top (applies to the card and the window), open at login, sign in with Google / sign in again / sign out, copy diagnostics, quit |
 | Floating widget | The Windows card: 224pt wide, one 18pt line per limit with the bar behind the text. Drag it by any part of the card to anywhere on any display; it remembers where you left it. **Keep on top** (on by default) keeps it above other apps; turn it off and it behaves like an ordinary window that other apps can cover and a click brings forward. Right-click it for refresh, keep on top, open at login, transparency, hide and quit. |
+
+## Signing in from the app
+
+When the card says **no login** or **auth**, it shows a **Sign in with Google…**
+button (also in the gear menu and the card's right-click menu). It opens claude.ai
+in your default browser. Pick **Continue with Google** there, or just **Authorize**
+if the browser is already signed in to claude.ai. The tab then says you're signed
+in, and usage appears within a few seconds.
+
+Under the hood it's the same OAuth flow Claude Code's `/login` uses: PKCE, Claude
+Code's public client id, and a one-shot listener on the loopback interface
+(127.0.0.1 and ::1, random port) for the redirect. Google doesn't hand the app a
+token directly; claude.ai does, after Google signs you in to it.
+
+The result is the app's **own** login, in its own Keychain item
+(`com.kryptohead.claude-usage`, account `oauth`). It is a separate refresh chain
+from Claude Code's, so the two never rotate each other's tokens, and logging out
+of Claude Code no longer blanks the widget. When it exists it is used first; Claude
+Code's login is the fallback. **Sign out** deletes it.
 
 ## Where the login comes from
 
-Claude Code on macOS keeps its OAuth login in either of two places, and the app
-checks both:
+Besides its own sign-in, the app reads Claude Code's OAuth login, which macOS
+keeps in either of two places. The app checks both:
 
 1. The **login Keychain**, generic password `Claude Code-credentials` (plus any
    suffixed variant created by `CLAUDE_CONFIG_DIR`)
@@ -67,7 +87,8 @@ it usually renews the token first, and the app just picks up the new one. If a
 write-back fails, the new refresh token goes into the app's own Keychain item
 (`com.kryptohead.claude-usage`) so the chain isn't lost.
 
-A **"no login"** or **"auth"** status means run `claude` in Terminal, then `/login`.
+A **"no login"** or **"auth"** status means click **Sign in with Google…** (or run
+`claude` in Terminal, then `/login`).
 `claude setup-token` tokens don't work: the usage endpoint rejects them with 403.
 
 ## Diagnostics

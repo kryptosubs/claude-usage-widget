@@ -18,6 +18,7 @@ struct OAuthCred {
         case keychain(service: String, account: String)
         case file(path: String)
         case env
+        case widget                // the widget's own browser sign-in (SignIn.swift)
     }
     var source: Source
     var accessToken: String
@@ -30,6 +31,7 @@ struct OAuthCred {
         case .keychain(let s, let a): return "Keychain: \(s) (\(a))"
         case .file(let p):            return "File: \(p)"
         case .env:                    return "CLAUDE_CODE_OAUTH_TOKEN"
+        case .widget:                 return "Widget sign-in"
         }
     }
     func isValid(nowMs: Double, marginMs: Double = 60_000) -> Bool {
@@ -67,10 +69,16 @@ enum CredParse {
         return try? JSONSerialization.data(withJSONObject: doc)
     }
 
-    /// Rank by expiry, never "first found": a stale login and a live one commonly
-    /// coexist, and taking the first meant authenticating with a month-dead token.
+    /// The widget's own sign-in first (refreshing it touches nobody else's token
+    /// chain), then by expiry, never "first found": a stale login and a live one
+    /// commonly coexist, and taking the first meant authenticating with a
+    /// month-dead token.
     static func rank(_ creds: [OAuthCred]) -> [OAuthCred] {
-        creds.sorted { $0.expiresAt > $1.expiresAt }
+        creds.sorted { a, b in
+            let wa = a.source == .widget, wb = b.source == .widget
+            if wa != wb { return wa }
+            return a.expiresAt > b.expiresAt
+        }
     }
 
     /// `security -w` prints the secret as text, or as hex if it is not printable.
@@ -158,6 +166,7 @@ final class MacCredentialStore: CredentialStore {
     static let defaultService = "Claude Code-credentials"
     static let ownService = "com.kryptohead.claude-usage"
     static let ownAccount = "refresh-token"
+    static let loginAccount = "oauth"      // the widget's own browser sign-in
 
     private var cachedItems: [(String, String)]? = nil
     private let lock = NSLock()
@@ -203,6 +212,7 @@ final class MacCredentialStore: CredentialStore {
             if let d = FileManager.default.contents(atPath: p),
                let c = CredParse.cred(from: d, source: .file(path: p)) { found.append(c) }
         }
+        if let w = loadLogin() { found.append(w) }
         return CredParse.rank(found)
     }
 
@@ -221,7 +231,29 @@ final class MacCredentialStore: CredentialStore {
             } catch { return false }
         case .env:
             return false
+        case .widget:
+            return setKeychain(service: Self.ownService, account: Self.loginAccount, data: data)
         }
+    }
+
+    // MARK: the widget's own login
+
+    func loadLogin() -> OAuthCred? {
+        let r = runProcess(Self.security, ["find-generic-password", "-s", Self.ownService, "-a", Self.loginAccount, "-w"])
+        guard r.status == 0, let d = CredParse.decodeSecret(r.out) else { return nil }
+        return CredParse.cred(from: d, source: .widget)
+    }
+
+    /// Store a fresh browser sign-in. Any rotated Claude Code refresh token the
+    /// widget was holding on to is dropped: the new login supersedes it.
+    func saveLogin(_ doc: JSON) -> Bool {
+        guard let d = try? JSONSerialization.data(withJSONObject: doc) else { return false }
+        saveOwnRefresh(nil)
+        return setKeychain(service: Self.ownService, account: Self.loginAccount, data: d)
+    }
+
+    func deleteLogin() {
+        _ = runProcess(Self.security, ["delete-generic-password", "-s", Self.ownService, "-a", Self.loginAccount])
     }
 
     /// `security -i` reads the command from stdin, so the secret never shows up

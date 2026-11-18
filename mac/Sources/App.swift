@@ -102,6 +102,9 @@ final class UsageModel: ObservableObject {
     @Published var hint: String?
     @Published var now = Date()
     @Published var lang: Lang = Settings.lang
+    @Published var signingIn = false
+    @Published var signedInHere = false       // the widget holds its own browser sign-in
+    private var signInTask: Task<Void, Never>?
 
     let store = MacCredentialStore()
     lazy var client = UsageClient(store: store)
@@ -118,6 +121,7 @@ final class UsageModel: ObservableObject {
 
     func start() {
         Lang.current = lang
+        signedInHere = store.loadLogin() != nil
         timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.tick() }
         }
@@ -130,6 +134,53 @@ final class UsageModel: ObservableObject {
     }
 
     func refreshNow() { backoff = 0; nextFetch = .distantPast; tick() }
+
+    var needsSignIn: Bool { status == .noToken || status == .auth }
+
+    /// Browser sign-in: claude.ai (Continue with Google) -> localhost -> Keychain.
+    func signIn() {
+        if signingIn { return }
+        signingIn = true
+        hint = T("Finish signing in in your browser…", "請在瀏覽器中完成登入…")
+        onChange?()
+        Log.write("sign-in: opening browser")
+        let client = client, store = store
+        signInTask = Task { @MainActor [self] in
+            do {
+                let doc = try await BrowserSignIn.run(client: client) { url in
+                    DispatchQueue.main.async { NSWorkspace.shared.open(url) }
+                }
+                guard store.saveLogin(doc) else { throw SignInError.save }
+                await client.reset()
+                signedInHere = true
+                account = OAuthFlow.email(fromDocument: doc)
+                hint = nil
+                Log.write("sign-in: ok (\(account ?? "no email in token response"))")
+                signingIn = false; signInTask = nil
+                refreshNow()
+            } catch {
+                Log.write("sign-in: failed (\(error))")
+                if let e = error as? SignInError, case .cancelled = e {
+                    hint = T("Sign-in cancelled.", "已取消登入。")
+                } else {
+                    hint = T("Sign-in failed: \(error)", "登入失敗：\(error)")
+                }
+                signingIn = false; signInTask = nil
+                onChange?()
+            }
+        }
+    }
+
+    func cancelSignIn() { signInTask?.cancel() }
+
+    func signOut() {
+        store.deleteLogin()
+        signedInHere = false
+        account = nil
+        Log.write("sign-out: widget sign-in removed")
+        let client = client
+        Task { @MainActor [self] in await client.reset(); refreshNow() }
+    }
 
     private func tick() {
         now = Date()
@@ -167,8 +218,10 @@ final class UsageModel: ObservableObject {
             switch e {
             case .noToken:
                 status = .noToken
-                hint = T("No Claude Code login found. Run `claude` in Terminal and /login.",
-                         "找不到 Claude Code 登入。請在終端機執行 `claude` 並 /login。")
+                if !signingIn {
+                    hint = T("Not signed in. Sign in with Google through claude.ai.",
+                             "尚未登入。請透過 claude.ai 用 Google 登入。")
+                }
                 backoff = 4
                 return
             default: break
@@ -176,8 +229,10 @@ final class UsageModel: ObservableObject {
             switch e.status {
             case 401, 403:
                 account = nil; status = .auth
-                hint = T("Login expired - run /login in Claude Code.",
-                         "登入已過期，請在 Claude Code 執行 /login。")
+                if !signingIn {
+                    hint = T("Login expired. Sign in again to resume.",
+                             "登入已過期，請重新登入。")
+                }
             case 429:
                 status = .throttled
                 hint = T("Rate limited - backing off.", "請求過於頻繁，稍後重試。")
@@ -263,6 +318,7 @@ struct UsageCard: View {
     let compact: Bool
     var onClose: (() -> Void)? = nil
     var closeHelp: String? = nil
+    var onSignIn: (() -> Void)? = nil
 
     var body: some View {
         VStack(alignment: .leading, spacing: compact ? 3 : 5) {
@@ -293,6 +349,21 @@ struct UsageCard: View {
                 Text(h).font(.system(size: 9.5)).foregroundColor(Palette.dim)
                     .fixedSize(horizontal: false, vertical: true)
             }
+
+            if let signIn = onSignIn, model.needsSignIn || model.signingIn {
+                Button(action: { model.signingIn ? model.cancelSignIn() : signIn() }) {
+                    Text(model.signingIn ? T("Cancel sign-in", "取消登入") : T("Sign in with Google…", "用 Google 登入…"))
+                        .font(.system(size: compact ? 10 : 11, weight: .semibold))
+                        .foregroundColor(.white)
+                        .padding(.horizontal, 10).padding(.vertical, 4)
+                        .background(RoundedRectangle(cornerRadius: 6)
+                            .fill(model.signingIn ? Color.white.opacity(0.18) : Color.accentColor))
+                }
+                .buttonStyle(.plain)
+                .padding(.top, 2)
+                .help(T("Opens claude.ai in your browser; choose Continue with Google there.",
+                        "在瀏覽器開啟 claude.ai，選擇 Continue with Google 即可。"))
+            }
         }
         .padding(.horizontal, 10).padding(.top, 7).padding(.bottom, 8)
         .frame(width: compact ? 224 : 372, alignment: .leading)
@@ -306,7 +377,8 @@ struct PopoverView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            UsageCard(model: model, compact: false, onClose: onClose, closeHelp: T("Close", "關閉"))
+            UsageCard(model: model, compact: false, onClose: onClose, closeHelp: T("Close", "關閉"),
+                      onSignIn: { app.signIn() })
             Divider().overlay(Color.white.opacity(0.08))
             HStack(spacing: 14) {
                 Button(T("Refresh", "更新")) { model.refreshNow() }
@@ -327,6 +399,13 @@ struct PopoverView: View {
                         get: { Settings.widgetOnTop }, set: { app.setWidgetOnTop($0) }))
                     Toggle(T("Open at login", "開機登入時啟動"), isOn: Binding(
                         get: { app.launchAtLogin }, set: { app.setLaunchAtLogin($0) }))
+                    Divider()
+                    Button(model.signedInHere ? T("Sign in again…", "重新登入…") : T("Sign in with Google…", "用 Google 登入…")) {
+                        app.signIn()
+                    }
+                    if model.signedInHere {
+                        Button(T("Sign out", "登出")) { model.signOut() }
+                    }
                     Divider()
                     Button(T("Copy diagnostics", "複製診斷資訊")) { app.copyDiagnostics() }
                     Button(T("Quit", "結束")) { NSApp.terminate(nil) }
@@ -364,7 +443,7 @@ struct WidgetView: View {
     @ObservedObject var model: UsageModel
     let app: AppDelegate
     var body: some View {
-        UsageCard(model: model, compact: true, onClose: { app.toggleWidget() })
+        UsageCard(model: model, compact: true, onClose: { app.toggleWidget() }, onSignIn: { app.signIn() })
             .background(RoundedRectangle(cornerRadius: 10).fill(Palette.card.opacity(0.95)))
             .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.white.opacity(0.15), lineWidth: 1))
             .contentShape(RoundedRectangle(cornerRadius: 10))
@@ -381,6 +460,9 @@ struct WidgetView: View {
                     get: { Settings.widgetOnTop }, set: { app.setWidgetOnTop($0) }))
                 Toggle(T("Open at login", "開機登入時啟動"), isOn: Binding(
                     get: { app.launchAtLogin }, set: { app.setLaunchAtLogin($0) }))
+                Button(model.signedInHere ? T("Sign in again…", "重新登入…") : T("Sign in with Google…", "用 Google 登入…")) {
+                    app.signIn()
+                }
                 Button(T("Toggle transparency", "切換透明度")) { app.toggleOpacity() }
                 Button(T("Hide widget", "隱藏小工具")) { app.toggleWidget() }
                 Divider()
@@ -771,6 +853,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             Log.write("open at login: LaunchAgent failed (\(error.localizedDescription))")
             return false
         }
+    }
+
+    func signIn() {
+        if !detailPinned { closeDetail() }
+        model.signIn()
     }
 
     func copyDiagnostics() {

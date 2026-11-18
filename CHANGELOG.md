@@ -9,6 +9,23 @@ Both languages of that card live in `cards.ts`; the `components/i18n.tsx` half
 this note used to point at was removed, because keeping two files in step by
 hand is what produced a version bumped on one side only.
 
+## v1.4 — 2026-11-18
+
+**New (Mac): sign in from the app with Google.** When the card shows **no
+login** or **auth**, a **Sign in with Google…** button opens claude.ai in the
+browser (Continue with Google, or one Authorize click if already signed in). The
+same PKCE flow as Claude Code's `/login` returns to a one-shot loopback listener,
+and the tokens go into the app's own Keychain item (`com.kryptohead.claude-usage`
+/ `oauth`). That login is a separate refresh chain from Claude Code's: it ranks
+first and refreshes on its own, and Claude Code logging out or expiring no longer
+leaves the widget with nothing to read. That was the cause of the "no login" this
+release fixes: the Mac had no Claude Code login left at all. Gear menu: **Sign in
+again…** and **Sign out**. Hints no longer tell you to run `/login` in Terminal.
+Tests: PKCE against the RFC 7636 vector, authorize URL, callback parsing, code
+exchange, own-chain refresh leaving Claude Code's token untouched, and a live
+loopback round-trip via `localhost`, `127.0.0.1` and `[::1]` (78 + 18 checks).
+Windows is unchanged.
+
 ## v1.3.1 — 2026-10-12
 
 **Fixed (Mac): two copies of the detail view, and the popover opening far below
