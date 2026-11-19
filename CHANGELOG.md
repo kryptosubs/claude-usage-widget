@@ -9,7 +9,26 @@ Both languages of that card live in `cards.ts`; the `components/i18n.tsx` half
 this note used to point at was removed, because keeping two files in step by
 hand is what produced a version bumped on one side only.
 
-## v1.4 — 2026-11-18
+## v1.5 — 2026-11-18
+
+**New (Windows): sign in from the widget with Google**, matching the Mac's v1.4.
+When the card shows **no login** or **auth**, a **Sign in with Google...** button
+opens claude.ai in the default browser. The same PKCE flow returns to a one-shot
+listener on `127.0.0.1` and `::1` (plain TcpListeners, polled from the UI timer:
+no http.sys reservation, no admin, no firewall prompt, and a browser's idle
+pre-connect socket can't stall the widget). Tokens go into `widget-login.dat`,
+DPAPI-encrypted to the Windows user and owner-only, in Claude Code's own
+credential shape. It is the widget's own refresh chain: tried first, renewed on
+its own, never touching Claude Code's token; a revoked one is dropped so the
+button comes back instead of a retry loop. Right-click menu and tray menu gain
+**Sign in again...** / **Sign out**. Signing out also clears the old account's
+numbers from the card. Hints no longer say to run `/login`; `Diagnose.cmd` lists
+the widget sign-in first. Status `no token` is now `no login`, as on the Mac.
+New `tests/Run-Tests.ps1` (38 checks, pwsh on Linux or Windows): RFC 7636 PKCE
+vector, authorize URL, callback parsing, code exchange (a 4xx is never replayed),
+own-chain refresh leaving Claude Code's file untouched, a live loopback round-trip,
+and the card's sign-in / cancel / timeout / forged-state / sign-out flows driven
+against stand-in controls. Mac unchanged.
 
 **New (Mac): sign in from the app with Google.** When the card shows **no
 login** or **auth**, a **Sign in with Google…** button opens claude.ai in the

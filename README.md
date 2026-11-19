@@ -4,9 +4,11 @@ A small always-on-top desktop widget showing live Claude usage: the 5-hour sessi
 window, the weekly cap, per-model weekly caps, and extra-usage credits — each with a
 progress bar and a countdown to reset.
 
-No Node, no Electron, no build step, no second login. It's one PowerShell script that
-uses Windows' built-in WPF and reads the OAuth token Claude Code already stored on
-this PC.
+No Node, no Electron, no build step. It's one PowerShell script that uses Windows'
+built-in WPF. It reads the OAuth token Claude Code already stored on this PC, or — if
+there is none — signs itself in with Google through claude.ai from a button on the card.
+
+The macOS version lives in [`mac/`](mac/README.md).
 
 ## Setup (2 steps)
 
@@ -20,13 +22,35 @@ That's it. If you also want it to start with Windows, double-click
 If Windows blocks the `.vbs`, right-click `ClaudeUsageWidget.ps1` →
 **Run with PowerShell** instead.
 
+## Sign in with Google (no Claude Code needed)
+
+When the card shows **no login** or **auth**, a **Sign in with Google...** button
+appears under it. Click it and claude.ai opens in your default browser: choose
+**Continue with Google** (or whatever your account uses), or just **Authorize** if
+the browser is already signed in to claude.ai. The tab then says *Signed in to
+Claude Usage* and the card fills in within a second.
+
+It is the same PKCE flow Claude Code's `/login` uses, returning to a one-shot
+listener on `127.0.0.1` / `::1` (loopback only: no admin rights, no firewall prompt).
+The tokens are saved to `widget-login.dat` beside the script, encrypted with Windows
+DPAPI so only your Windows account on this PC can read them, and locked to your
+account with an owner-only ACL.
+
+That login is the widget's **own**, on a separate refresh chain from Claude Code's.
+It is tried first, the widget keeps it renewed by itself, and it never rotates
+Claude Code's token out from under it. Right-click the card (or the tray icon) for
+**Sign in again...** and **Sign out**. Signing out only removes the widget's login;
+Claude Code's logins below are untouched and are used again if present.
+
 ## Where the token comes from
 
-The widget finds **every** Claude Code login on the machine and uses the freshest one:
+In order:
 
 1. `CLAUDE_CODE_OAUTH_TOKEN` (if you set it — wins outright)
-2. `%USERPROFILE%\.claude\.credentials.json` — Claude Code installed on Windows
-3. Every WSL distro, read via `wsl.exe -d <distro> -e bash -lc 'cat ~/.claude/.credentials.json'`
+2. The widget's own sign-in, `widget-login.dat` (above)
+3. Every Claude Code login on the machine, freshest first:
+   - `%USERPROFILE%\.claude\.credentials.json` — Claude Code installed on Windows
+   - every WSL distro, read via `wsl.exe -d <distro> -e bash -lc 'cat ~/.claude/.credentials.json'`
 
 This matters: a native-Windows install you abandoned months ago and a live WSL install
 commonly coexist, and taking whichever turns up first means authenticating with a dead
@@ -98,15 +122,15 @@ already excludes it.
 
 ## When something goes wrong
 
-Double-click **`Diagnose.cmd`**. It prints, in order: every Claude Code login it
-found (Windows *and* every WSL distro), each one's expiry and
+Double-click **`Diagnose.cmd`**. It prints, in order: the widget's own sign-in (if
+any), every Claude Code login it found (Windows *and* every WSL distro), each one's expiry and
 whether it has a refresh token, which refresh endpoints are alive, which login actually
 served the request, the account email, and the raw usage response.
 
 | Widget shows | Meaning |
 | --- | --- |
-| `no token` | No Claude Code login found anywhere — run `claude` once |
-| `auth` | Every login on the machine is dead — run `claude` once, in whichever environment you actually use it (WSL counts) |
+| `no login` | No login anywhere — click **Sign in with Google...** on the card |
+| `auth` | Every login is dead — click **Sign in with Google...** (or `/login` in Claude Code) |
 | `throttled` | Rate limited (429) — backing off, last good numbers still shown |
 | `offline` | Network or endpoint error — run `Diagnose.cmd` |
 
@@ -124,10 +148,10 @@ former area, with the same information on screen.
 | Hover a row | Full label and reset time |
 | **X button** (top right) | Close the widget and quit |
 | **Esc** | Same |
-| Right-click the widget | Refresh, hide to tray, close |
+| Right-click the widget | Refresh, hide to tray, sign in / sign in again / sign out, close |
 | Drag | Move the widget (position is remembered) |
 | Double-click | Refresh now |
-| Tray icon (right-click) | Show/hide, refresh, startup toggle, transparency, exit |
+| Tray icon (right-click) | Show/hide, refresh, startup toggle, transparency, sign in / out, exit |
 | Tray icon (hover) | 5h and 7d percentages at a glance |
 
 The widget is a borderless window, so it has no title bar of its own — the X in its
@@ -160,7 +184,10 @@ right-click menu are always there. Closing shuts the process down completely.
   time zone and locale. The widget uses the compact form (`4h25m  4:20 PM`);
   `Diagnose.cmd` prints the long form (`resets in 4h 25m (4:20 PM)`).
 - Settings, window position and the renewed credential live in `widget-state.json`
-  beside the script (owner-only ACL; never commit it).
+  beside the script (owner-only ACL; never commit it). The Google sign-in lives in
+  `widget-login.dat` (DPAPI-encrypted, owner-only; also gitignored).
+- Tests: `pwsh -NoProfile -File tests/Run-Tests.ps1` (runs on Windows or Linux; the
+  loopback listener is exercised for real, the network is stubbed).
 - `/api/oauth/usage` is undocumented and used internally by Claude Code's own usage
   HUD. If Anthropic changes the `anthropic-beta: oauth-2025-04-20` header value, the
   widget will show `auth` and you'll need to bump that string in the script.

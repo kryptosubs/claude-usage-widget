@@ -7,3 +7,6 @@ claude-usage-widget.zip
 
 # macOS build output
 mac/build/
+
+# The widget's own sign-in (DPAPI-encrypted refresh token) - never commit this.
+widget-login.dat
