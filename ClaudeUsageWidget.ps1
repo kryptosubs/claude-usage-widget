@@ -3,7 +3,8 @@
   live Claude usage (5-hour session window, weekly, per-model weekly, extra usage).
 
   Requires nothing but Windows PowerShell 5.1 (built in). No install, no Node, no Electron.
-  Reads your existing Claude Code OAuth token; never asks you to log in again.
+  Reads your existing Claude Code OAuth token, or signs itself in with Google through
+  claude.ai (the same PKCE flow as Claude Code's /login) and keeps that login on its own.
 
   Usage:  right-click ClaudeUsageWidget.ps1 -> Run with PowerShell
      or:  double-click Start-Widget.vbs (no console window)
@@ -37,6 +38,13 @@ $Script:TokenUrls  = @(
 )
 $Script:UserAgent  = 'claude-code/2.0.0'   # required: without it the endpoint uses a harsh rate-limit bucket
 
+# The widget's own browser sign-in (see "the widget's own sign-in" below).
+$Script:LoginPath    = Join-Path $Script:Root 'widget-login.dat'
+$Script:AuthorizeUrl = 'https://claude.ai/oauth/authorize'
+# What a claude.ai (subscription) login needs. org:create_api_key is a Console scope
+# and makes the claude.ai authorize page refuse the request.
+$Script:SignInScopes = 'user:profile user:inference user:sessions:claude_code user:mcp_servers'
+
 $Script:State = [ordered]@{
     Left           = $null
     Top            = $null
@@ -58,21 +66,24 @@ function Load-State {
     }
 }
 $Script:StateProtected = $false
-# widget-state.json holds a refresh token, so it must not be world-readable.
-# The script can live anywhere (Downloads, a shared folder), so don't rely on
-# the parent directory's ACL - set an explicit owner-only rule once.
-function Protect-StateFile {
-    if ($Script:StateProtected) { return }
+# widget-state.json and widget-login.dat hold refresh tokens, so they must not be
+# world-readable. The script can live anywhere (Downloads, a shared folder), so
+# don't rely on the parent directory's ACL - set an explicit owner-only rule.
+function Set-OwnerOnlyAcl([string]$Path) {
     try {
-        $acl = Get-Acl -Path $Script:StatePath
+        $acl = Get-Acl -Path $Path
         $acl.SetAccessRuleProtection($true, $false)   # stop inheriting, drop inherited entries
         foreach ($r in @($acl.Access)) { [void]$acl.RemoveAccessRule($r) }
         $me   = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
         $rule = New-Object System.Security.AccessControl.FileSystemAccessRule($me, 'FullControl', 'Allow')
         $acl.SetAccessRule($rule)
-        Set-Acl -Path $Script:StatePath -AclObject $acl
-        $Script:StateProtected = $true
-    } catch { }
+        Set-Acl -Path $Path -AclObject $acl
+        return $true
+    } catch { return $false }
+}
+function Protect-StateFile {
+    if ($Script:StateProtected) { return }
+    if (Set-OwnerOnlyAcl $Script:StatePath) { $Script:StateProtected = $true }
 }
 
 function Save-State {
@@ -206,6 +217,363 @@ function Invoke-TokenRefresh([string]$RefreshToken) {
     throw 'REFRESH_FAILED:unknown'
 }
 
+# ---------------------------------------------------------------- the widget's own sign-in
+#
+# The same OAuth flow Claude Code's /login uses: PKCE, Claude Code's public client
+# id, a localhost redirect. The browser opens claude.ai, where "Continue with Google"
+# (or whatever the account uses) does the actual sign-in; if the browser is already
+# signed in to claude.ai it is one "Authorize" click. claude.ai then redirects to a
+# one-shot listener on the loopback interface with a code, which is exchanged for an
+# access + refresh token pair.
+#
+# The result is the widget's OWN login, kept in widget-login.dat (DPAPI-encrypted to
+# this Windows user, owner-only ACL). It is a separate refresh chain from Claude
+# Code's, so the widget refreshing never rotates Claude Code's token out from under
+# it, and Claude Code logging out or expiring no longer leaves the widget with
+# nothing to read. It is tried before any Claude Code login.
+
+function ConvertTo-Base64Url([byte[]]$Bytes) {
+    return ([Convert]::ToBase64String($Bytes)).TrimEnd('=').Replace('+', '-').Replace('/', '_')
+}
+
+# 32 random bytes -> 43 url-safe chars: a valid PKCE verifier, also used as state.
+function New-RandomToken([int]$Bytes = 32) {
+    $b = New-Object byte[] $Bytes
+    $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+    try { $rng.GetBytes($b) } finally { $rng.Dispose() }
+    return (ConvertTo-Base64Url $b)
+}
+
+function Get-PkceChallenge([string]$Verifier) {
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try { return (ConvertTo-Base64Url ($sha.ComputeHash([Text.Encoding]::ASCII.GetBytes($Verifier)))) }
+    finally { $sha.Dispose() }
+}
+
+function Get-RedirectUri([int]$Port) { return ('http://localhost:{0}/callback' -f $Port) }
+
+# No code=true here: that switches claude.ai to the copy-and-paste flow.
+function Get-AuthorizeUrl([int]$Port, [string]$Challenge, [string]$State) {
+    $q = [ordered]@{
+        client_id             = $Script:ClientId
+        response_type         = 'code'
+        redirect_uri          = (Get-RedirectUri $Port)
+        scope                 = $Script:SignInScopes
+        code_challenge        = $Challenge
+        code_challenge_method = 'S256'
+        state                 = $State
+    }
+    $pairs = foreach ($k in $q.Keys) { $k + '=' + [Uri]::EscapeDataString([string]$q[$k]) }
+    return ($Script:AuthorizeUrl + '?' + ($pairs -join '&'))
+}
+
+# First line of an HTTP request -> @{ Code; State; Error }, or $null for anything
+# other than GET /callback (browsers also ask for /favicon.ico).
+function ConvertFrom-CallbackLine([string]$Line) {
+    if (-not $Line) { return $null }
+    $parts = $Line.Split(' ')
+    if ($parts.Count -lt 2 -or $parts[0] -cne 'GET') { return $null }
+    $target = $parts[1]; $path = $target; $query = ''
+    $qi = $target.IndexOf('?')
+    if ($qi -ge 0) { $path = $target.Substring(0, $qi); $query = $target.Substring($qi + 1) }
+    if ($path -ne '/callback') { return $null }
+
+    $p = @{}
+    foreach ($kv in $query.Split('&')) {
+        if (-not $kv) { continue }
+        $eq = $kv.IndexOf('=')
+        if ($eq -lt 0) { $k = $kv; $v = '' } else { $k = $kv.Substring(0, $eq); $v = $kv.Substring($eq + 1) }
+        try {
+            $k = [Uri]::UnescapeDataString($k.Replace('+', ' '))
+            $v = [Uri]::UnescapeDataString($v.Replace('+', ' '))
+        } catch { continue }
+        if ($v -and -not $p.ContainsKey($k)) { $p[$k] = $v }
+    }
+    $code = $p['code']; $state = $p['state']
+    # the manual flow hands out "code#state"; accept that shape too
+    if ($code -and $code.Contains('#')) {
+        $h = $code.IndexOf('#')
+        if (-not $state) { $state = $code.Substring($h + 1) }
+        $code = $code.Substring(0, $h)
+    }
+    $err = $p['error_description']
+    if (-not $err) { $err = $p['error'] }
+    return @{ Code = $code; State = $state; Error = $err }
+}
+
+# The page the browser lands on. Both languages; Chinese as HTML entities so this
+# file stays pure ASCII.
+function Get-SignInPageHtml([bool]$Ok, [string]$ErrorText) {
+    if ($Ok) {
+        $title = 'Signed in to Claude Usage'; $colour = '#5fd38d'
+        $en = 'You can close this tab.'
+        $zh = 'Claude Usage &#x5DF2;&#x767B;&#x5165;&#xFF0C;&#x53EF;&#x4EE5;&#x95DC;&#x9589;&#x9019;&#x500B;&#x5206;&#x9801;&#x3002;'
+    } else {
+        $title = 'Sign-in did not finish'; $colour = '#ff6b6b'
+        $en = 'Go back to Claude Usage and try again.'
+        $zh = '&#x767B;&#x5165;&#x6C92;&#x6709;&#x5B8C;&#x6210;&#xFF0C;&#x8ACB;&#x56DE;&#x5230; Claude Usage &#x518D;&#x8A66;&#x4E00;&#x6B21;&#x3002;'
+    }
+    $detail = ''
+    if ($ErrorText) { $detail = '<p class=e>' + [System.Net.WebUtility]::HtmlEncode($ErrorText) + '</p>' }
+    return ('<!doctype html><html><head><meta charset="utf-8"><title>{0}</title>' +
+            '<style>body{{font:15px "Segoe UI",system-ui,sans-serif;background:#1f1f1f;color:#eee;' +
+            'display:flex;align-items:center;justify-content:center;height:100vh;margin:0}}' +
+            'div{{text-align:center}}h1{{font-size:20px;color:{1}}}.e{{color:#aaa;font-size:13px}}</style>' +
+            '</head><body><div><h1>{0}</h1><p>{2}</p><p>{3}</p>{4}</div></body></html>') -f $title, $colour, $en, $zh, $detail
+}
+
+# Token response -> a document in Claude Code's own credential shape, so
+# New-CredSource and the refresh code handle it unchanged.
+function New-LoginDocument($Resp, [double]$NowMs) {
+    if (-not $Resp -or $Resp.PSObject.Properties.Name -notcontains 'access_token' -or -not $Resp.access_token) { return $null }
+    $ttl = 3600
+    if ($Resp.PSObject.Properties.Name -contains 'expires_in' -and $Resp.expires_in) { $ttl = [double]$Resp.expires_in }
+    $o = [ordered]@{ accessToken = [string]$Resp.access_token; expiresAt = [int64]($NowMs + $ttl * 1000) }
+    if ($Resp.PSObject.Properties.Name -contains 'refresh_token' -and $Resp.refresh_token) { $o.refreshToken = [string]$Resp.refresh_token }
+    if ($Resp.PSObject.Properties.Name -contains 'scope' -and $Resp.scope) {
+        $o.scopes = @(([string]$Resp.scope).Split(' ') | Where-Object { $_ })
+    }
+    $doc = [ordered]@{ claudeAiOauth = $o }
+    if ($Resp.PSObject.Properties.Name -contains 'account' -and $Resp.account) {
+        foreach ($k in @('email_address', 'email')) {
+            if ($Resp.account.PSObject.Properties.Name -contains $k -and $Resp.account.$k) { $doc.account = [string]$Resp.account.$k; break }
+        }
+    }
+    return $doc
+}
+
+# DPAPI, CurrentUser scope: only this Windows account on this PC can decrypt it.
+function Protect-LoginText([string]$Text) {
+    Add-Type -AssemblyName System.Security -ErrorAction SilentlyContinue
+    $bytes = [Text.Encoding]::UTF8.GetBytes($Text)
+    $enc = [System.Security.Cryptography.ProtectedData]::Protect($bytes, $null,
+               [System.Security.Cryptography.DataProtectionScope]::CurrentUser)
+    return [Convert]::ToBase64String($enc)
+}
+function Unprotect-LoginText([string]$Blob) {
+    Add-Type -AssemblyName System.Security -ErrorAction SilentlyContinue
+    $dec = [System.Security.Cryptography.ProtectedData]::Unprotect([Convert]::FromBase64String($Blob.Trim()), $null,
+               [System.Security.Cryptography.DataProtectionScope]::CurrentUser)
+    return [Text.Encoding]::UTF8.GetString($dec)
+}
+
+function Save-Login($Doc) {
+    $json = $Doc | ConvertTo-Json -Depth 6 -Compress
+    Set-Content -LiteralPath $Script:LoginPath -Value (Protect-LoginText $json) -Encoding ASCII
+    [void](Set-OwnerOnlyAcl $Script:LoginPath)
+}
+function Read-Login {
+    try {
+        if (-not (Test-Path -LiteralPath $Script:LoginPath)) { return $null }
+        return ((Unprotect-LoginText (Get-Content -LiteralPath $Script:LoginPath -Raw)) | ConvertFrom-Json)
+    } catch { return $null }   # unreadable (another user, another PC): treat as signed out
+}
+function Test-Login { return [bool](Test-Path -LiteralPath $Script:LoginPath) }
+function Remove-Login {
+    try { if (Test-Path -LiteralPath $Script:LoginPath) { Remove-Item -LiteralPath $Script:LoginPath -Force } } catch { }
+}
+# Takes either shape: the dictionary New-LoginDocument builds, or the object Read-Login parses.
+function Get-LoginEmail($Doc) {
+    if (-not $Doc) { return $null }
+    if ($Doc -is [System.Collections.IDictionary]) {
+        if ($Doc.Contains('account') -and $Doc['account']) { return [string]$Doc['account'] }
+        return $null
+    }
+    if ($Doc.PSObject.Properties.Name -contains 'account' -and $Doc.account) { return [string]$Doc.account }
+    return $null
+}
+
+# Same token endpoints as refresh. A code works once, so a 4xx is final: replaying
+# it on the fallback host would only earn a second, more confusing rejection.
+function Invoke-CodeExchange([string]$Code, [string]$Verifier, [string]$RedirectUri, [string]$State) {
+    $body = [ordered]@{
+        grant_type    = 'authorization_code'
+        code          = $Code
+        redirect_uri  = $RedirectUri
+        client_id     = $Script:ClientId
+        code_verifier = $Verifier
+        state         = $State
+    } | ConvertTo-Json -Compress
+    $last = 'no token endpoint reachable'
+    foreach ($url in $Script:TokenUrls) {
+        try {
+            $r = Invoke-RestMethod -Uri $url -Method Post -Body $body `
+                     -ContentType 'application/json' -UserAgent $Script:UserAgent -TimeoutSec 20
+        }
+        catch {
+            $sc = Get-HttpStatus $_
+            $detail = ''
+            try { if ($_.ErrorDetails -and $_.ErrorDetails.Message) { $detail = [string]$_.ErrorDetails.Message } } catch { }
+            if ($detail.Length -gt 200) { $detail = $detail.Substring(0, 200) }
+            if ($sc -ge 400 -and $sc -lt 500 -and $sc -ne 404) {
+                throw ('token exchange rejected ({0}) {1}' -f $sc, $detail).Trim()
+            }
+            $last = $_.Exception.Message
+            continue
+        }
+        if ($r -and $r.PSObject.Properties.Name -contains 'access_token' -and $r.access_token) { return $r }
+        throw 'no access token in the token response'   # the code is spent either way
+    }
+    throw ('token exchange failed: ' + $last)
+}
+
+# Everything after the browser comes back: check it, exchange the code, and return
+# a login document ready for Save-Login. Throws a short, user-readable reason.
+function Complete-BrowserSignIn($Callback, [string]$Verifier, [string]$State, [int]$Port) {
+    if (-not $Callback) { throw 'no redirect from the browser' }
+    if ($Callback.Error) { throw ('claude.ai said: ' + $Callback.Error) }
+    if ($Callback.State -cne $State) { throw 'state mismatch (ignored a stray redirect)' }
+    if (-not $Callback.Code) { throw 'no code in the redirect' }
+    $r = Invoke-CodeExchange $Callback.Code $Verifier (Get-RedirectUri $Port) $State
+    $doc = New-LoginDocument $r ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds())
+    if (-not $doc) { throw 'no access token in the token response' }
+    return $doc
+}
+
+# --- one-shot HTTP listener on the loopback interface, polled from the UI timer.
+#
+# Plain TcpListeners on 127.0.0.1 and ::1, not HttpListener: no http.sys URL
+# reservation, no admin rights, no firewall prompt (loopback only). Nothing here
+# blocks: connections are accepted when Pending() and read only when DataAvailable,
+# so a browser's idle pre-connect socket can never stall the widget.
+
+function Start-CallbackServer {
+    for ($attempt = 0; $attempt -lt 5; $attempt++) {
+        $v4 = New-Object System.Net.Sockets.TcpListener ([System.Net.IPAddress]::Loopback), 0
+        $v4.Start()
+        $port = ([System.Net.IPEndPoint]$v4.LocalEndpoint).Port
+        $ls = @($v4)
+        try {
+            $v6 = New-Object System.Net.Sockets.TcpListener ([System.Net.IPAddress]::IPv6Loopback), $port
+            $v6.Start()
+            $ls += $v6
+        }
+        catch {
+            # "localhost" may resolve to ::1 first. If something else already owns that
+            # port on ::1 the browser could land there, so pick another port. With no
+            # IPv6 loopback at all, 127.0.0.1 alone is fine.
+            $inUse = $false
+            $ex = $_.Exception
+            while ($ex) {
+                if ($ex -is [System.Net.Sockets.SocketException] -and
+                    $ex.SocketErrorCode -eq [System.Net.Sockets.SocketError]::AddressAlreadyInUse) { $inUse = $true }
+                $ex = $ex.InnerException
+            }
+            if ($inUse) { try { $v4.Stop() } catch { }; continue }
+        }
+        return @{ Port = $port; Listeners = $ls; Conns = (New-Object System.Collections.Generic.List[object]); Done = $false }
+    }
+    throw 'no free loopback port'
+}
+
+function Send-HttpResponse($Stream, [string]$Status, [string]$Html) {
+    $body = [Text.Encoding]::UTF8.GetBytes($Html)
+    # build the string first: inside a method call's parentheses the comma would
+    # split the -f arguments into method arguments
+    $headText = ("HTTP/1.1 {0}`r`nContent-Type: text/html; charset=utf-8`r`n" +
+                 "Content-Length: {1}`r`nCache-Control: no-store`r`nConnection: close`r`n`r`n") -f $Status, $body.Length
+    $head = [Text.Encoding]::ASCII.GetBytes($headText)
+    $Stream.Write($head, 0, $head.Length)
+    if ($body.Length) { $Stream.Write($body, 0, $body.Length) }
+    $Stream.Flush()
+}
+
+function Close-CallbackConn($Srv, $Conn) {
+    try { $Conn.Client.Close() } catch { }
+    [void]$Srv.Conns.Remove($Conn)
+}
+
+# Call repeatedly. Returns the callback (once) when the browser comes back, else $null.
+function Step-CallbackServer($Srv) {
+    if (-not $Srv -or $Srv.Done) { return $null }
+    foreach ($l in $Srv.Listeners) {
+        while ($l.Pending()) {
+            $c = $l.AcceptTcpClient()
+            $Srv.Conns.Add(@{ Client = $c; Data = (New-Object System.IO.MemoryStream); Since = [datetime]::UtcNow })
+        }
+    }
+    foreach ($cn in $Srv.Conns.ToArray()) {
+        try {
+            $s = $cn.Client.GetStream()
+            $buf = New-Object byte[] 4096
+            while ($s.DataAvailable -and $cn.Data.Length -lt 16384) {
+                $n = $s.Read($buf, 0, $buf.Length)
+                if ($n -le 0) { break }
+                $cn.Data.Write($buf, 0, $n)
+            }
+            $text = [Text.Encoding]::ASCII.GetString($cn.Data.ToArray())
+            # answer only once the whole request is in: closing a socket with unread
+            # bytes makes Windows send a reset, and the browser shows an error page
+            if ($text.IndexOf("`r`n`r`n") -lt 0 -and $cn.Data.Length -lt 16384) {
+                if (([datetime]::UtcNow - $cn.Since).TotalSeconds -gt 10) { Close-CallbackConn $Srv $cn }
+                continue
+            }
+            $first = $text.Split([string[]]@("`r`n"), [StringSplitOptions]::None)[0]
+            $cb = ConvertFrom-CallbackLine $first
+            if (-not $cb) {
+                Send-HttpResponse $s '404 Not Found' ''
+                Close-CallbackConn $Srv $cn
+                continue
+            }
+            Send-HttpResponse $s '200 OK' (Get-SignInPageHtml ([bool]($cb.Code -and -not $cb.Error)) $cb.Error)
+            Close-CallbackConn $Srv $cn
+            $Srv.Done = $true
+            return $cb
+        }
+        catch { Close-CallbackConn $Srv $cn }
+    }
+    return $null
+}
+
+function Stop-CallbackServer($Srv) {
+    if (-not $Srv) { return }
+    foreach ($l in @($Srv.Listeners)) { try { $l.Stop() } catch { } }
+    foreach ($cn in $Srv.Conns.ToArray()) { Close-CallbackConn $Srv $cn }
+    $Srv.Done = $true
+}
+
+# --- the widget login as a token source.
+#
+# Returns an access token, or $null to fall back to Claude Code's logins. The widget
+# refreshes this chain itself and writes every rotated refresh token back to
+# widget-login.dat, so it stays signed in for as long as it keeps running.
+$Script:WidgetForceRefresh = $false   # set after a 401/403 on the widget's token
+$Script:LastWidgetError    = $null
+function Get-WidgetAccessToken([double]$NowMs) {
+    $doc = Read-Login
+    if (-not $doc) { return $null }
+    $c = New-CredSource 'Widget sign-in' $doc
+    if (-not $c) { return $null }
+
+    if (-not $Script:WidgetForceRefresh -and ($c.ExpiresAt -eq 0 -or $c.ExpiresAt -gt ($NowMs + 60000))) {
+        $Script:UsedSource = 'Widget sign-in'
+        return $c.Oauth.accessToken
+    }
+    if (-not $c.HasRefresh) { return $null }
+
+    try { $t = Invoke-TokenRefresh $c.Oauth.refreshToken }
+    catch {
+        $Script:LastWidgetError = 'Widget sign-in -> ' + $_.Exception.Message
+        # rejected = revoked or already spent: it can never work again, so drop it
+        # and let the card offer "Sign in with Google" instead of retrying forever
+        if ($_.Exception.Message -like 'REFRESH_REJECTED*') { Remove-Login; $Script:WidgetForceRefresh = $false }
+        return $null
+    }
+    $new = New-LoginDocument $t $NowMs
+    if (-not $new) { $Script:LastWidgetError = 'Widget sign-in -> no access token in refresh response'; return $null }
+    # keep what a refresh response may leave out
+    if (-not $new.claudeAiOauth.Contains('refreshToken')) { $new.claudeAiOauth.refreshToken = [string]$c.Oauth.refreshToken }
+    if (-not $new.claudeAiOauth.Contains('scopes') -and $c.Oauth.PSObject.Properties.Name -contains 'scopes' -and $c.Oauth.scopes) {
+        $new.claudeAiOauth.scopes = @($c.Oauth.scopes)
+    }
+    if (-not $new.Contains('account')) { $mail = Get-LoginEmail $doc; if ($mail) { $new.account = $mail } }
+    try { Save-Login $new }
+    catch { $Script:LastWidgetError = 'Widget sign-in -> could not save the renewed login: ' + $_.Exception.Message }
+    $Script:WidgetForceRefresh = $false
+    $Script:UsedSource = 'Widget sign-in (refreshed)'
+    return $new.claudeAiOauth.accessToken
+}
+
 # Collect EVERY Claude Code login on this machine, not just the first one found.
 # A stale native-Windows install and a live WSL install commonly coexist; picking
 # whichever we stumbled on first is how you end up authenticating with a dead token.
@@ -236,14 +604,27 @@ function Get-AccessToken {
     if ($env:CLAUDE_CODE_OAUTH_TOKEN) { return $env:CLAUDE_CODE_OAUTH_TOKEN }
 
     $now = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+
+    # the widget's own sign-in comes first: refreshing it touches nobody else's token
+    $Script:LastWidgetError = $null
+    $w = Get-WidgetAccessToken $now
+    if ($w) { return $w }
+    $errs = @()
+    if ($Script:LastWidgetError) { $errs += $Script:LastWidgetError; $Script:LastRefreshError = $Script:LastWidgetError }
+
     if ($Script:State.CachedToken -and $Script:State.CachedExpires -gt ($now + 60000)) {
+        $Script:UsedSource = 'widget-state.json (cached)'
         return $Script:State.CachedToken
     }
 
     $sources = @(Get-CredentialSources)
     if ($sources.Count -eq 0) {
         $sources = @(Get-CredentialSources -Force)
-        if ($sources.Count -eq 0) { throw 'NOTOKEN' }
+        if ($sources.Count -eq 0) {
+            # still signed in, just could not renew (offline?) - that is not "no login"
+            if ($Script:LastWidgetError -and (Test-Login)) { throw $Script:LastWidgetError }
+            throw 'NOTOKEN'
+        }
     }
 
     # pass 1: any login whose access token is still valid
@@ -269,7 +650,6 @@ function Get-AccessToken {
         if ($c.HasRefresh) { $candidates.Add(@{ Label = $c.Label; Token = $c.Oauth.refreshToken; Own = $false }) }
     }
 
-    $errs = @()
     foreach ($cand in $candidates.ToArray()) {
         try {
             $t = Invoke-TokenRefresh $cand.Token
@@ -566,9 +946,28 @@ function Invoke-Diagnose {
 
     if ($env:CLAUDE_CODE_OAUTH_TOKEN) { Write-Host 'token source : CLAUDE_CODE_OAUTH_TOKEN env var' -ForegroundColor Green }
     else {
+        $now0 = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+        Write-Host 'Widget sign-in (Sign in with Google, used first):'
+        $wdoc = Read-Login
+        $wc = $null
+        if ($wdoc) { $wc = New-CredSource 'Widget sign-in' $wdoc }
+        if ($wc) {
+            $who = Get-LoginEmail $wdoc
+            if (-not $who) { $who = '(no email recorded)' }
+            $exp = [DateTimeOffset]::FromUnixTimeMilliseconds([long]$wc.ExpiresAt).ToLocalTime().ToString('yyyy-MM-dd HH:mm')
+            $state = 'access token expired, will refresh'
+            if ($wc.ExpiresAt -gt ($now0 + 60000)) { $state = 'access token valid until ' + $exp }
+            Write-Host ("  {0}: {1}" -f $who, $state) -ForegroundColor Green
+            Write-Host ("  {0}" -f $Script:LoginPath) -ForegroundColor DarkGray
+        }
+        elseif (Test-Login) { Write-Host ("  {0} exists but cannot be read by this Windows user" -f $Script:LoginPath) -ForegroundColor Yellow }
+        else { Write-Host '  (not signed in - use "Sign in with Google" on the widget)' -ForegroundColor DarkGray }
+        Write-Host ''
+
         Write-Host 'Claude Code logins found on this machine:'
         $sources = @(Get-CredentialSources -Force)
-        if ($sources.Count -eq 0) {
+        if ($sources.Count -eq 0 -and $wc) { Write-Host '  (none - fine, the widget sign-in above is used)' -ForegroundColor DarkGray }
+        elseif ($sources.Count -eq 0) {
             Write-Host '  (none)' -ForegroundColor Red
             Write-Host ''
             Write-Host 'Searched:'
@@ -577,10 +976,10 @@ function Invoke-Diagnose {
             if ($d.Count) { foreach ($x in $d) { Write-Host ("  WSL[{0}] ~/.claude, /root/.claude, /home/*/.claude" -f $x) } }
             else { Write-Host '  (no WSL distros detected)' }
             Write-Host ''
-            Write-Host 'RESULT: run "claude" once in your terminal to sign in.' -ForegroundColor Red
+            Write-Host 'RESULT: click "Sign in with Google" on the widget (or run "claude" and /login).' -ForegroundColor Red
             return
         }
-        $now = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+        $now = $now0
         foreach ($c in $sources) {
             $when = 'no expiry recorded'; $colour = 'Gray'
             if ($c.ExpiresAt -gt 0) {
@@ -649,7 +1048,8 @@ function Invoke-Diagnose {
         if ($Script:LastRefreshError) { Write-Host ("  refresh error: {0}" -f $Script:LastRefreshError) -ForegroundColor Red }
         if ($sc -eq 401 -or $sc -eq 403) {
             Write-Host '  -> no usable login: expired and not refreshable.' -ForegroundColor Yellow
-            Write-Host '     Run "claude" (in WSL if that is where you use it) and /login again.'
+            Write-Host '     Click "Sign in with Google" on the widget, or run "claude"'
+            Write-Host '     (in WSL if that is where you use it) and /login again.'
             Write-Host '     Note: "claude setup-token" does NOT work here - the usage endpoint'
             Write-Host '     rejects those sk-ant-oat01 tokens with 403.'
         }
@@ -691,6 +1091,12 @@ if ($Diagnose) { Invoke-Diagnose; return }
       <StackPanel x:Name="Rows"/>
       <TextBlock x:Name="HintText" Text="" Foreground="#8A8A95" FontFamily="Segoe UI" FontSize="9"
                  TextWrapping="Wrap" Margin="0,5,0,0" Visibility="Collapsed"/>
+      <!-- shown only when there is no usable login, or while signing in -->
+      <Border x:Name="SignInBtn" Background="#D97757" CornerRadius="5" Cursor="Hand" Margin="0,6,0,0"
+              Padding="8,4,8,5" Visibility="Collapsed" ToolTip="Opens claude.ai in your browser">
+        <TextBlock x:Name="SignInText" Text="Sign in with Google..." Foreground="#FFFFFF" FontFamily="Segoe UI"
+                   FontSize="11" FontWeight="SemiBold" HorizontalAlignment="Center"/>
+      </Border>
     </StackPanel>
   </Border>
 </Window>
@@ -705,6 +1111,8 @@ $hintText   = $win.FindName('HintText')
 $accountText = $win.FindName('AccountText')
 $closeBtn   = $win.FindName('CloseBtn')
 $closeGlyph = $win.FindName('CloseGlyph')
+$signInBtn  = $win.FindName('SignInBtn')
+$signInText = $win.FindName('SignInText')
 $win.Opacity = [double]$Script:State.Opacity
 
 if ($null -ne $Script:State.Left -and $null -ne $Script:State.Top) {
@@ -809,6 +1217,25 @@ $Script:LastData    = $null
 $Script:LastOk      = $null
 $Script:Backoff     = 0
 $Script:NextFetchAt = [datetime]::MinValue
+$Script:NeedsSignIn = $false
+$Script:SignIn      = $null   # @{ Srv; Verifier; State; Deadline } while the browser is out
+
+function Set-Hint([string]$text) {
+    if ($text) { $hintText.Text = $text; $hintText.Visibility = 'Visible' }
+    else { $hintText.Visibility = 'Collapsed' }
+}
+
+function Update-SignInUi {
+    if ($Script:SignIn) {
+        $signInText.Text = 'Cancel sign-in'; $signInBtn.Background = (B '#2EFFFFFF')
+        $signInBtn.Visibility = 'Visible'
+    } elseif ($Script:NeedsSignIn) {
+        $signInText.Text = 'Sign in with Google...'; $signInBtn.Background = (B '#D97757')
+        $signInBtn.Visibility = 'Visible'
+    } else {
+        $signInBtn.Visibility = 'Collapsed'
+    }
+}
 
 function Render {
     if (-not $Script:LastData) { return }
@@ -838,13 +1265,14 @@ function Update-Usage {
         $Script:LastData = Get-Usage
         $Script:LastOk   = [datetime]::UtcNow
         $Script:Backoff  = 0
+        $Script:NeedsSignIn = $false
         if (-not $Script:Account) {
             try {
                 $Script:Account = Get-ProfileEmail (Get-Profile)
                 if ($Script:Account) { $accountText.Text = $Script:Account }
             } catch { }   # cosmetic only - never let this break the usage display
         }
-        $hintText.Visibility = 'Collapsed'
+        if (-not $Script:SignIn) { Set-Hint '' }
         Render
     }
     catch {
@@ -852,18 +1280,26 @@ function Update-Usage {
         $code = Get-HttpStatus $_
 
         if ($msg -eq 'NOTOKEN') {
-            Show-Message "No Claude Code login found.`nRun `"claude`" once, then click to retry."
-            $statusText.Text = 'no token'; $statusText.Foreground = (B '#F87171')
+            $Script:NeedsSignIn = $true
+            $Script:Account = $null
+            $Script:LastData = $null   # e.g. just signed out: don't keep showing that account's numbers
+            $Script:LastOk = $null
+            $accountText.Text = 'Claude Usage'
+            Show-Message 'Not signed in.'
+            if (-not $Script:SignIn) { Set-Hint 'Sign in with Google through claude.ai.' }
+            $statusText.Text = 'no login'; $statusText.Foreground = (B '#F87171')
             $Script:Backoff = 4
             return
         }
         if ($code -eq 401 -or $code -eq 403) {
+            # a rejected widget token gets one forced refresh before giving up on it
+            if ("$Script:UsedSource" -like 'Widget sign-in*') { $Script:WidgetForceRefresh = $true }
             $Script:CredSources = $null            # re-scan: the user may have just logged in
             $Script:State.CachedToken = $null
             $Script:Account = $null
+            $Script:NeedsSignIn = $true
             $accountText.Text = 'Claude Usage'
-            $hintText.Text = 'Login expired - run /login in Claude Code.'
-            $hintText.Visibility = 'Visible'
+            if (-not $Script:SignIn) { Set-Hint 'Login expired. Sign in again to resume.' }
             $statusText.Text = 'auth'; $statusText.Foreground = (B '#F87171')
         }
         elseif ($code -eq 429) {
@@ -883,13 +1319,91 @@ function Update-Usage {
     finally {
         $mult = [math]::Pow(2, $Script:Backoff)
         $Script:NextFetchAt = [datetime]::UtcNow.AddSeconds($RefreshSeconds * $mult)
+        Update-SignInUi
     }
 }
+
+# ---------------------------------------------------------------- sign in with Google
+
+function Request-Refresh { $Script:NextFetchAt = [datetime]::MinValue; $Script:Backoff = 0 }
+
+function Start-SignIn {
+    if ($Script:SignIn) { return }
+    try { $srv = Start-CallbackServer }
+    catch { Set-Hint ('Sign-in failed: could not listen for the browser ({0})' -f $_.Exception.Message); return }
+    $verifier = New-RandomToken
+    $state    = New-RandomToken
+    $url = Get-AuthorizeUrl $srv.Port (Get-PkceChallenge $verifier) $state
+    $Script:SignIn = @{ Srv = $srv; Verifier = $verifier; State = $state; Deadline = [datetime]::UtcNow.AddMinutes(5) }
+    Set-Hint 'Finish signing in in your browser...'
+    Update-SignInUi
+    $signInTimer.Start()
+    try { Start-Process $url }
+    catch {
+        # no default browser registered: hand the link over instead
+        try { [System.Windows.Clipboard]::SetText($url) } catch { }
+        Set-Hint 'Could not open a browser. The sign-in link is on the clipboard - paste it into one.'
+    }
+}
+
+# $Callback is the browser's redirect, or $null with $Reason when it never came.
+function Complete-SignIn($Callback, [string]$Reason) {
+    $si = $Script:SignIn
+    if (-not $si) { return }
+    $Script:SignIn = $null
+    $signInTimer.Stop()
+    Stop-CallbackServer $si.Srv
+    try {
+        if (-not $Callback) { throw $Reason }
+        $doc = Complete-BrowserSignIn $Callback $si.Verifier $si.State $si.Srv.Port
+        try { Save-Login $doc } catch { throw ('could not save the login ({0})' -f $_.Exception.Message) }
+        $Script:WidgetForceRefresh = $false
+        $Script:NeedsSignIn = $false
+        $Script:Account = Get-LoginEmail $doc
+        if ($Script:Account) { $accountText.Text = $Script:Account }
+        Set-Hint ''
+        Request-Refresh
+    }
+    catch {
+        $m = $_.Exception.Message
+        if ($m -eq 'cancelled') { Set-Hint 'Sign-in cancelled.' }
+        else { Set-Hint ('Sign-in failed: ' + $m) }
+    }
+    Update-SignInUi
+}
+
+function Invoke-SignInButton {
+    if ($Script:SignIn) { Complete-SignIn $null 'cancelled' } else { Start-SignIn }
+}
+
+function Invoke-SignOut {
+    if ($Script:SignIn) { Complete-SignIn $null 'cancelled' }
+    Remove-Login
+    $Script:WidgetForceRefresh = $false
+    $Script:Account = $null
+    $accountText.Text = 'Claude Usage'
+    Request-Refresh
+}
+
+# Polls the loopback listener while the browser is out. Separate from the 1s ticker
+# so the redirect is answered promptly; never blocks (see Step-CallbackServer).
+$signInTimer = New-Object System.Windows.Threading.DispatcherTimer
+$signInTimer.Interval = [TimeSpan]::FromMilliseconds(200)
+$signInTimer.Add_Tick({
+    $si = $Script:SignIn
+    if (-not $si) { $signInTimer.Stop(); return }
+    if ([datetime]::UtcNow -gt $si.Deadline) { Complete-SignIn $null 'timed out waiting for the browser'; return }
+    $cb = $null
+    try { $cb = Step-CallbackServer $si.Srv }
+    catch { Complete-SignIn $null ('could not listen for the browser ({0})' -f $_.Exception.Message); return }
+    if ($cb) { Complete-SignIn $cb $null }
+})
 
 # ---------------------------------------------------------------- interaction
 
 # Every quit route funnels through here so the tray icon can never be orphaned.
 function Close-Widget {
+    try { if ($Script:SignIn) { $signInTimer.Stop(); Stop-CallbackServer $Script:SignIn.Srv; $Script:SignIn = $null } } catch { }
     try { if ($timer) { $timer.Stop() } } catch { }
     try { if ($tray)  { $tray.Visible = $false; $tray.Dispose() } } catch { }
     try { $win.Close() } catch { }
@@ -922,12 +1436,37 @@ $closeBtn.Add_MouseLeftButtonDown({
 $closeBtn.Add_MouseEnter({ $closeBtn.Background = (B '#E0F87171'); $closeGlyph.Foreground = (B '#FFFFFF') })
 $closeBtn.Add_MouseLeave({ $closeBtn.Background = (B '#00FFFFFF'); $closeGlyph.Foreground = (B '#8A8A95') })
 
+# --- sign-in button (same DragMove trap as the close button) -----
+$signInBtn.Add_MouseLeftButtonDown({
+    param($sender, $e)
+    if ($e) { $e.Handled = $true }
+    Invoke-SignInButton
+})
+$signInBtn.Add_MouseEnter({ if (-not $Script:SignIn) { $signInBtn.Background = (B '#E38A6D') } else { $signInBtn.Background = (B '#40FFFFFF') } })
+$signInBtn.Add_MouseLeave({ Update-SignInUi })
+
+function Get-SignInMenuLabel {
+    if ($Script:SignIn) { return 'Cancel sign-in' }
+    if (Test-Login)     { return 'Sign in again...' }
+    return 'Sign in with Google...'
+}
+
 # --- right-click menu on the widget itself, so quitting is discoverable
 # without hunting for a tray icon Windows may have hidden in the overflow
 $ctx = New-Object System.Windows.Controls.ContextMenu
 $ctxRefresh = New-Object System.Windows.Controls.MenuItem
 $ctxRefresh.Header = 'Refresh now'
-$ctxRefresh.Add_Click({ $Script:NextFetchAt = [datetime]::MinValue; $Script:Backoff = 0 })
+$ctxRefresh.Add_Click({ Request-Refresh })
+$ctxSignIn = New-Object System.Windows.Controls.MenuItem
+$ctxSignIn.Header = 'Sign in with Google...'
+$ctxSignIn.Add_Click({ Invoke-SignInButton })
+$ctxSignOut = New-Object System.Windows.Controls.MenuItem
+$ctxSignOut.Header = 'Sign out'
+$ctxSignOut.Add_Click({ Invoke-SignOut })
+$ctx.Add_Opened({
+    $ctxSignIn.Header = Get-SignInMenuLabel
+    if (Test-Login) { $ctxSignOut.Visibility = 'Visible' } else { $ctxSignOut.Visibility = 'Collapsed' }
+})
 $ctxHide = New-Object System.Windows.Controls.MenuItem
 $ctxHide.Header = 'Hide to tray'
 $ctxHide.Add_Click({ $win.Hide() })
@@ -936,6 +1475,9 @@ $ctxClose.Header = 'Close'
 $ctxClose.Add_Click({ Close-Widget })
 $ctx.Items.Add($ctxRefresh) | Out-Null
 $ctx.Items.Add($ctxHide)    | Out-Null
+$ctx.Items.Add((New-Object System.Windows.Controls.Separator)) | Out-Null
+$ctx.Items.Add($ctxSignIn)  | Out-Null
+$ctx.Items.Add($ctxSignOut) | Out-Null
 $ctx.Items.Add((New-Object System.Windows.Controls.Separator)) | Out-Null
 $ctx.Items.Add($ctxClose)   | Out-Null
 $win.ContextMenu = $ctx
@@ -961,14 +1503,23 @@ $menu.Items.Add('-') | Out-Null
 $miStart = $menu.Items.Add('Run at Windows startup')
 $miDim   = $menu.Items.Add('Toggle transparency')
 $menu.Items.Add('-') | Out-Null
+$miSignIn  = $menu.Items.Add('Sign in with Google...')
+$miSignOut = $menu.Items.Add('Sign out')
+$menu.Items.Add('-') | Out-Null
 $miExit = $menu.Items.Add('Exit')
 $tray.ContextMenuStrip = $menu
+$menu.Add_Opening({
+    $miSignIn.Text = Get-SignInMenuLabel
+    $miSignOut.Visible = (Test-Login)
+})
+$miSignIn.Add_Click({ Invoke-SignInButton })
+$miSignOut.Add_Click({ Invoke-SignOut })
 
 $startupLnk = Join-Path ([Environment]::GetFolderPath('Startup')) 'Claude Usage Widget.lnk'
 $miStart.Checked = Test-Path $startupLnk
 
 $miShow.Add_Click({ if ($win.Visibility -eq 'Visible') { $win.Hide() } else { $win.Show(); $win.Activate() } })
-$miRef.Add_Click({ $Script:NextFetchAt = [datetime]::MinValue; $Script:Backoff = 0 })
+$miRef.Add_Click({ Request-Refresh })
 $miDim.Add_Click({
     if ($win.Opacity -gt 0.8) { $win.Opacity = 0.62 } else { $win.Opacity = 0.95 }
     $Script:State.Opacity = $win.Opacity; Save-State
