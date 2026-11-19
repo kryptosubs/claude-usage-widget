@@ -66,6 +66,9 @@ New-Item -ItemType Directory -Path $CcDir | Out-Null
 $CcFile = Join-Path $CcDir '.credentials.json'
 $env:USERPROFILE = $null
 Remove-Item Env:\CLAUDE_CODE_OAUTH_TOKEN -ErrorAction SilentlyContinue
+# Hide the machine's real WSL logins (a function beats the executable), or on a PC
+# that has Claude Code in WSL "no login anywhere" is never true.
+function wsl.exe { }
 $Mail = 'user@example.com'
 
 function NowMs { return [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() }
